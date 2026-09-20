@@ -1,0 +1,82 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: aws-deployment
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+    with:
+      # Pulumi handles the image build after these checks pass.
+      skip-docker-build: true
+
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION || 'us-east-1' }}
+      AWS_ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+      PULUMI_BACKEND_URL: ${{ vars.PULUMI_BACKEND_URL }}
+      PULUMI_STACK: demo
+      PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_CONFIG_PASSPHRASE }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: infra/pulumi
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: npm
+          cache-dependency-path: infra/pulumi/package-lock.json
+      - name: Check deployment settings
+        run: |
+          : "${AWS_ROLE_ARN:?Set the AWS_ROLE_ARN repository variable}"
+          : "${PULUMI_BACKEND_URL:?Set the PULUMI_BACKEND_URL repository variable}"
+          : "${PULUMI_CONFIG_PASSPHRASE:?Set the PULUMI_CONFIG_PASSPHRASE repository secret}"
+          test -f "Pulumi.${PULUMI_STACK}.yaml"
+      - name: Authenticate with AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: scos-deploy-${{ github.run_id }}
+      - uses: pulumi/actions@v6
+        with:
+          pulumi-version: 3.263.0
+      - run: npm ci
+      - name: Select the existing stack
+        run: |
+          pulumi login "$PULUMI_BACKEND_URL" --non-interactive
+          pulumi stack select "$PULUMI_STACK" --non-interactive
+          test "$(pulumi config get aws:region)" = "$AWS_REGION"
+      - name: Preview changes
+        run: pulumi preview --non-interactive --diff
+      - name: Publish image and deploy
+        run: pulumi up --yes --skip-preview --non-interactive
+      - name: Check deployed image and API
+        run: |
+          SC_CLUSTER=$(pulumi stack output ecsClusterName)
+          SC_SERVICE=$(pulumi stack output fargateServiceName)
+          SC_IMAGE=$(pulumi stack output deployedImage)
+          SC_TASK_DEFINITION=$(aws ecs describe-services --cluster "$SC_CLUSTER" --services "$SC_SERVICE" --query 'services[0].taskDefinition' --output text)
+          SC_RUNNING_IMAGE=$(aws ecs describe-task-definition --task-definition "$SC_TASK_DEFINITION" --query "taskDefinition.containerDefinitions[?name=='screencloud-oms'].image | [0]" --output text)
+          test "$SC_RUNNING_IMAGE" = "$SC_IMAGE"
+          SC_API_TOKEN=$(pulumi config get apiToken)
+          printf '::add-mask::%s\n' "$SC_API_TOKEN"
+          SC_API_URL=$(pulumi stack output apiUrl)
+          API_URL="$SC_API_URL" API_TOKEN="$SC_API_TOKEN" SMOKE_ID="$GITHUB_SHA" node ../../scripts/smoke.mjs
+          printf 'Deployment verified.\n\nImage: %s\n' "$SC_IMAGE" >> "$GITHUB_STEP_SUMMARY"

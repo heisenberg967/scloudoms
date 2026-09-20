@@ -1,0 +1,9 @@
+# Only these files are needed by the production Dockerfile.
+*
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/
+!src/**
+**/.DS_Store
+**/._*

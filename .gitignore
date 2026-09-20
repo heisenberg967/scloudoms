@@ -1,0 +1,41 @@
+# Installed dependencies and tool caches
+node_modules/
+.cache/
+.vite/
+.vite-temp/
+
+# Generated builds and test output
+dist/
+build/
+coverage/
+.nyc_output/
+*.tsbuildinfo
+infra/pulumi/*.js
+infra/pulumi/*.js.map
+
+# Local data and credentials
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+.env
+.env.*
+!.env.example
+.pulumi/
+Pulumi.*.yaml
+!infra/pulumi/Pulumi.demo.yaml
+
+# Local editorial notes; the finished README is the project documentation
+docs/
+
+# Editor, OS, and temporary files
+.DS_Store
+._*
+Thumbs.db
+.idea/
+.vscode/
+*.log
+*.tmp
+*.bak
+*~

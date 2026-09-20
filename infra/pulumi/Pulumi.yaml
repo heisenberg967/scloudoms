@@ -1,0 +1,3 @@
+name: screencloud-oms-infra
+runtime: nodejs
+description: Pulumi AWS deployment for ScreenCloud Order Management System (ALB, ECS Fargate, RDS PostgreSQL, CloudWatch)
