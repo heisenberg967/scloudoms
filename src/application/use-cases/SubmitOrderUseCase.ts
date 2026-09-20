@@ -4,7 +4,8 @@ import { Order } from '../../domain/models/Order.js';
 import { OrderEvaluator } from '../../domain/services/OrderEvaluator.js';
 import {
   InsufficientStockError,
-  OrderInvalidThresholdError
+  OrderInvalidThresholdError,
+  PricingRuleNotConfiguredError
 } from '../../domain/errors/DomainErrors.js';
 import { IOrderUnitOfWork } from '../ports/IOrderUnitOfWork.js';
 import { SubmitOrderInput, SubmitOrderInputSchema } from '../dtos/OrderDTOs.js';
@@ -42,6 +43,7 @@ export class SubmitOrderUseCase {
       const warehouses = await tx.lockWarehouses();
       const product = await tx.products.getDefaultProduct();
       const rule = await tx.pricingRules.getActiveRule();
+      if (!rule) throw new PricingRuleNotConfiguredError();
       const evaluation = OrderEvaluator.evaluate(
         input.quantity,
         destination,
@@ -67,7 +69,7 @@ export class SubmitOrderUseCase {
         orderNumber,
         idempotencyKey,
         salesRepId,
-        pricingRuleId: rule?.id,
+        pricingRuleId: rule.id,
         quantity: input.quantity,
         shippingCoordinates: destination,
         pricing: evaluation.pricing,
