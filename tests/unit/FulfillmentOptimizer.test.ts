@@ -5,6 +5,8 @@ import { PricingEngine } from '../../src/domain/services/PricingEngine.js';
 import { FulfillmentOptimizer } from '../../src/domain/services/FulfillmentOptimizer.js';
 
 describe('FulfillmentOptimizer', () => {
+  const optimizer = new FulfillmentOptimizer();
+
   // Test fixture warehouses matching challenge specifications
   const createWarehouses = () => [
     new Warehouse({
@@ -52,7 +54,7 @@ describe('FulfillmentOptimizer', () => {
     const quantity = 30;
     const pricing = PricingEngine.calculatePricing(quantity);
 
-    const plan = FulfillmentOptimizer.optimizeFulfillment(
+    const plan = optimizer.optimizeFulfillment(
       quantity,
       customerManhattan,
       warehouses,
@@ -76,7 +78,7 @@ describe('FulfillmentOptimizer', () => {
     const quantity = 400;
     const pricing = PricingEngine.calculatePricing(quantity);
 
-    const plan = FulfillmentOptimizer.optimizeFulfillment(
+    const plan = optimizer.optimizeFulfillment(
       quantity,
       customerNearLA,
       warehouses,
@@ -102,7 +104,7 @@ describe('FulfillmentOptimizer', () => {
     const pricing = PricingEngine.calculatePricing(excessQuantity);
     const customer = Coordinates.create(40.7128, -74.006);
 
-    const plan = FulfillmentOptimizer.optimizeFulfillment(
+    const plan = optimizer.optimizeFulfillment(
       excessQuantity,
       customer,
       warehouses,
@@ -125,7 +127,7 @@ describe('FulfillmentOptimizer', () => {
     // Shipping cost = 10,000 km * 0.365 kg * 0.01 = $36.50 > $22.50 threshold
     const pricing = PricingEngine.calculatePricing(quantity);
 
-    const plan = FulfillmentOptimizer.optimizeFulfillment(
+    const plan = optimizer.optimizeFulfillment(
       quantity,
       antarctica,
       warehouses,
