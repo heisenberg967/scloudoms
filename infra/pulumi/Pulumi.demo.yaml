@@ -4,4 +4,4 @@ config:
   screencloud-oms-infra:dbPassword:
     secure: v1:/AvTCm+ApcN2c/8l:sDZKsdJV+Nf5x8s93LkGjcMNS3tMQQjAvkyRQS1UxBsR3tPV
   screencloud-oms-infra:apiToken:
-    secure: v1:EKjxZWjQxYJtvz+Y:G68BP+Gnta3wUb+qi6yH31enuDWCYq4uSwgPVDSUqZ36E8gm
+    secure: v1:RJl/KVjEdvm6c0Kc:10NloUepKJInDfMLsE6lTN/fA3nZPutAOeyFfuCvlO/smSoFgK/KDyIZtuPgvUTPljCF7zp8MDAQvuOaYHRavLK3p2Klid8A7WAd0u3rUxI=
