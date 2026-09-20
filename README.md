@@ -11,7 +11,7 @@ Everything else — the discount tiers, the API shape, the database schema — e
 
 **The device**: SCOS Station P1 Pro, $150, 365g. **Volume discounts**: 5% at 25 units, 10% at 50, 15% at 100, 20% at 250. **Shipping**: $0.01 per kilogram per kilometre, and if the cheapest possible shipping still exceeds 15% of the discounted total, the order is invalid — no exceptions, no partial fulfillment loophole.
 
-**Technical asks from the brief**: TypeScript, a real database, a documented API, a clear (not necessarily exhaustive) testing strategy, trivial local setup, and — as an explicit bonus, not a requirement — cloud deployment with CI/CD. Opinionated frameworks like NestJS were specifically discouraged.
+**Technical asks from the brief**: TypeScript, a real database, a documented API, a clear testing strategy, trivial local setup, and an optional cloud deployment with CI/CD. Opinionated frameworks like NestJS were specifically discouraged.
 
 ## Final result
 
@@ -185,8 +185,6 @@ outbox_events         Pending domain events, waiting for a publisher that doesn'
 
 ### Tradeoffs & assumptions
 
-A short, honest list, so none of this reads as something I overlooked:
-
 - **Haversine distance, not carrier routing.** Great-circle distance is a reasonable proxy for "how far away is this warehouse," but it's not what a truck or plane actually drives/flies. Matches the brief; a real logistics system would want carrier-quoted rates.
 - **Quotes don't reserve stock**, on purpose — see "a quote is a guess" above. It also means a quote can go stale the instant someone else submits.
 - **The greedy allocator assumes a linear shipping cost with zero fixed cost per warehouse.** True today, false the moment ScreenCloud negotiates a flat per-shipment handling fee.
@@ -215,16 +213,16 @@ CI (`ci.yml`) runs on every push and PR against `main`: the test suite against a
 
 Pulumi provisions ECR, an API Gateway HTTP API, a private Application Load Balancer, one Fargate task, a private single-AZ RDS PostgreSQL instance, CloudWatch logs, and Secrets Manager entries for the database URL and API token. **API Gateway is what gives this real HTTPS** — its own `execute-api.amazonaws.com` certificate, with zero domain purchase or DNS setup — and it reaches the ALB privately through a VPC Link, so the load balancer itself is never exposed to the internet directly. One Fargate task and a single-AZ database trade redundancy for cost, deliberately, for a graded demo — this isn't the shape I'd pick for something serving real customers.
 
-### The deploy did not go smoothly, and I think that's worth being honest about
+### The deploy took a few tries
 
-In the interest of not pretending everything just worked on the first try: getting this actually live on AWS surfaced four completely real, completely unglamorous problems, in order —
+Getting this actually live on AWS surfaced a few issues:
 
 1. **RDS refused to create** because the AWS account was still on Free Tier, which caps automated backup retention below the general 1–35 day range I'd set. Fixed by upgrading the account to pay-as-you-go, not a code change — the config was already reasonable, the account tier wasn't.
 2. **CloudFront was my first choice** for free HTTPS with no domain — until AWS rejected `CreateDistribution` outright with "your account must be verified," a manual, no-ETA support gate on newer accounts. Rather than block the whole submission on an AWS Support ticket, I swapped it for **API Gateway + VPC Link**, which gets the same result (public HTTPS, private origin, no domain) without that gate.
 3. **A cancelled deploy left a stale lock** on the Pulumi state file, and a separate interrupted image push left Pulumi believing an image existed in ECR that had actually never finished uploading. Both are exactly the kind of state-vs-reality drift that distributed infrastructure tooling occasionally produces — resolved by clearing the lock and dropping the stale resource from state so the next run rebuilt it for real.
 4. **The container crash-looped in production** because the configured API token was shorter than the 32-character minimum the app itself enforces on startup — a real guard doing exactly its job, just against a bad config value.
 
-None of these were code design flaws — they were real infrastructure quirks, and diagnosing "why is this actually broken" via ECS task logs and target-group health rather than guessing is, if anything, a better demonstration of the job than a deploy that happened to work first try.
+None of these were code design flaws, they were real infrastructure quirks, and diagnosing "why is this actually broken" via ECS task logs and target-group health rather than guessing is, if anything, a better demonstration of the job than a deploy that happened to work first try.
 
 ## Testing strategy
 
