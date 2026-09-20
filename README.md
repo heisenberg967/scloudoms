@@ -1,37 +1,110 @@
 # ScreenCloud Order Management System
 
-A backend for quoting and submitting orders for ScreenCloud's SCOS Station P1 Pro. Creating an order record is the easy part; the interesting part is finding the cheapest way to fulfill it across six warehouses, and keeping inventory correct when two sales reps hit submit on the last few units at the same time.
+## What this is
 
-The goal was to keep the solution simple where the brief allows it, and treat the parts that matter — pricing, allocation, concurrency — like production code.
+ScreenCloud sells a device called the SCOS Station P1 Pro, and the sales team needed a way to quote and place orders for it. That's the brief in one sentence. The interesting part isn't "build a form that writes to a database" — it's two harder problems hiding underneath:
 
-## The problem
+1. The device ships from six warehouses around the world, and shipping is charged by weight and distance. So for any order, you need to figure out the *cheapest possible way* to fulfill it — possibly splitting it across several warehouses — and reject it outright if shipping still comes out too expensive.
+2. Two sales reps can try to buy the last few units at the same second. Whatever the system decides, it can't sell more devices than physically exist.
 
-The SCOS Station P1 Pro costs **$150** and weighs **365 g**. Orders qualify for the largest discount they reach: **5% at 25 units, 10% at 50, 15% at 100, 20% at 250**. Stock is spread across six warehouses:
+Everything else — the discount tiers, the API shape, the database schema — exists in service of getting those two things right.
 
-| Warehouse | Coordinates | Stock |
-| --- | --- | --- |
-| Los Angeles | 33.9425, -118.408056 | 355 |
-| New York | 40.639722, -73.778889 | 578 |
-| São Paulo | -23.435556, -46.473056 | 265 |
-| Paris | 49.009722, 2.547778 | 694 |
-| Warsaw | 52.165833, 20.967222 | 245 |
-| Hong Kong | 22.308889, 113.914444 | 419 |
+**The device**: SCOS Station P1 Pro, $150, 365g. **Volume discounts**: 5% at 25 units, 10% at 50, 15% at 100, 20% at 250. **Shipping**: $0.01 per kilogram per kilometre, and if the cheapest possible shipping still exceeds 15% of the discounted total, the order is invalid — no exceptions, no partial fulfillment loophole.
 
-Shipping costs **$0.01 per kilogram per kilometre**, and an order can draw stock from several warehouses at once. If the cheapest possible shipping still exceeds **15% of the discounted order total**, the order is invalid — full stop, no partial fulfillment workaround.
+**Technical asks from the brief**: TypeScript, a real database, a documented API, a clear (not necessarily exhaustive) testing strategy, trivial local setup, and — as an explicit bonus, not a requirement — cloud deployment with CI/CD. Opinionated frameworks like NestJS were specifically discouraged.
 
-That leads to two workflows, plus a way to look one up afterward:
+## Final result
 
-| Endpoint | Behaviour |
-| --- | --- |
-| `POST /v1/order-quotes` | Simulate price, discount, shipping, and allocation without touching inventory. |
-| `POST /v1/orders` | Recalculate against live stock, commit atomically, and deduct inventory immediately. |
-| `GET /v1/orders/:orderNumber` | Return the amounts and allocation exactly as they were at submission. |
+- **Live API**: `https://kl4ds7ecj0.execute-api.us-east-1.amazonaws.com/` — real HTTPS, running on AWS right now, not a screenshot of `localhost`.
+- **Swagger docs**: same host, `/docs/`. It's gated behind a bearer token like every other business route here — this is shared via email along with this submission.
+- **Repo**: `https://github.com/heisenberg967/scloudoms`
 
-Those three satisfy the brief's functional requirements. TypeScript, PostgreSQL, OpenAPI docs, Docker, and the testing strategy below satisfy its technical ones.
+**Swagger, live**, listing every route behind the bearer token:
 
-## Architecture at a glance
+![Swagger UI showing the SCOS OMS API routes](assets/swagger-docs.png)
 
-The service is a modular monolith: a single deployable with clear internal boundaries, rather than a distributed system built for a scale six warehouses don't require.
+**A real quote request against the live deployment** (token redacted — same rule as everywhere else in this README):
+
+![Sample order-quote request and response from the live API](assets/sample-quote-request.png)
+
+What actually works, the TL;DR is: quoting and submitting orders with correct discounts, cheapest-first multi-warehouse allocation, the 15% shipping cap enforced properly, orders that survive concurrent submissions without overselling stock, idempotent retries, full order history with historically-accurate snapshots, and a CI/CD pipeline that actually deploys this to AWS behind real HTTPS on every manual trigger — not just a GitHub Actions badge that's never been tested.
+
+## Running the app
+
+### Option 1 — the live one
+
+Hit the deployed API directly. You'll need a bearer token (shared via email):
+
+```sh
+API=https://kl4ds7ecj0.execute-api.us-east-1.amazonaws.com
+TOKEN=your-token-here
+
+curl $API/health   # public, no token needed
+curl $API/ready    # public, no token needed
+
+curl $API/v1/order-quotes \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"quantity":30,"customerCoordinates":{"latitude":40.7128,"longitude":-74.006}}'
+```
+
+Fair warning: any order you *submit* against the live deployment deducts from real (small) seeded stock, and there's no reset button short of tearing the stack down and redeploying. Quote away freely; submit sparingly.
+
+### Option 2 — locally, which is genuinely easier
+
+You need Git and Docker (with Compose v2). That's it — no Node install, no AWS account, no Pulumi.
+
+```sh
+git clone https://github.com/heisenberg967/scloudoms.git
+cd scloudoms
+cp .env.example .env
+docker compose up --build -d --wait
+curl --fail http://localhost:3000/ready
+```
+
+That last command should come back with `"status":"READY"` and `"database":"CONNECTED"`. Startup builds the schema and seeds the product, pricing rules, and all six warehouses automatically — there's no separate migration or seed step to remember.
+
+Try it:
+
+```sh
+curl --fail-with-body http://localhost:3000/v1/order-quotes \
+  -H 'Authorization: Bearer local-development-token-change-before-deployment' \
+  -H 'Content-Type: application/json' \
+  -d '{"quantity":30,"customerCoordinates":{"latitude":40.7128,"longitude":-74.006}}'
+```
+
+To actually submit it (deducts stock, returns an order number), send the same body to `/v1/orders`:
+
+```sh
+curl --fail-with-body http://localhost:3000/v1/orders \
+  -H 'Authorization: Bearer local-development-token-change-before-deployment' \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: local-order-1' \
+  -d '{"quantity":30,"customerCoordinates":{"latitude":40.7128,"longitude":-74.006}}'
+```
+
+That `Idempotency-Key` header is just a string *you* make up — the server doesn't hand one out, you pick something unique per order attempt (a UUID, a request ID from whatever's calling this, anything). Here's why it exists: imagine the order goes through, stock gets deducted, an order number gets generated — and then the network drops before your client ever sees the response. Do you retry? If there were no idempotency key, retrying would create a *second* real order and deduct stock twice for something that already succeeded once. With the key, retrying the exact same request (same key, same input) just returns the original order back — no duplicate, no double deduction. Reuse the same key with genuinely different input (different quantity, say), and you get a `409` instead, because that's not a retry, that's a mistake. It's optional — leave the header off and every submission is treated as new — but for anything that might get retried by a flaky connection or an eager client, it's the difference between "safe to retry" and "don't you dare retry."
+
+Retrieve the order later at `/v1/orders/:orderNumber` using the `orderNumber` from the response above. Everything else — `/api/v1/warehouses`, `/metrics`, `/docs`, tearing it down, developing with live reload — is covered in [Local development, in full](#local-development-in-full) near the bottom, so this section doesn't turn into a novel.
+
+## Technical design
+
+### Repo structure
+
+```text
+src/
+  presentation/     HTTP routes, auth, validation, OpenAPI, startup
+  application/      Quote, submit and retrieve workflows; the transaction port
+  domain/           Pricing, allocation and validity rules — the actual brain
+  infrastructure/   PostgreSQL adapters, migrations, outbox, metrics
+tests/
+  unit/             Pure calculations, no I/O
+  integration/      Real PostgreSQL — HTTP through to persistence and back
+infra/pulumi/       The AWS deployment, as code
+```
+
+The rule I held myself to: `domain/` doesn't know Fastify, PostgreSQL, or AWS exist. Not one import. If I want to swap the allocation algorithm, I shouldn't have to think about how routes are registered. If I want to swap the database, the pricing rules shouldn't notice.
+
+### Architecture
 
 ```mermaid
 flowchart TD
@@ -42,149 +115,225 @@ flowchart TD
     Adapters --> DB[(PostgreSQL)]
 ```
 
-The domain layer has no idea Fastify, `postgres`, or AWS exist — no HTTP objects, no SQL, no imports pointing outward. The submission use case orchestrates a unit of work; it doesn't write queries itself.
+Dependencies only point one direction. `SubmitOrderUseCase` orchestrates the flow but doesn't contain a single line of SQL — it asks a `IOrderUnitOfWork` to do the work and trusts it to come back with either a committed order or a clear error.
 
-```text
-src/
-  presentation/     HTTP routes, auth, validation, OpenAPI and startup
-  application/      Quote, submit and retrieve workflows; transaction port
-  domain/           Pricing, allocation and validity rules, models
-  infrastructure/   PostgreSQL adapters, migrations, outbox and metrics
-tests/
-  unit/             Calculations without I/O
-  integration/      API, persistence and concurrency against real PostgreSQL
-infra/pulumi/       AWS deployment definition
+Here's the part that actually matters, shown as a sequence rather than described in prose — two sales reps racing for the same stock:
+
+```mermaid
+sequenceDiagram
+    participant A as Rep A
+    participant B as Rep B
+    participant DB as PostgreSQL
+
+    Note over DB: 10 units left, one warehouse
+    A->>DB: BEGIN, lock warehouse rows
+    B->>DB: BEGIN, lock warehouse rows (waits)
+    A->>DB: recalculate, deduct 8, commit
+    DB-->>A: order confirmed
+    Note over DB: 2 units left
+    B->>DB: lock granted, recalculate against current stock
+    DB-->>B: INSUFFICIENT_STOCK (only 2 left, wanted 8)
 ```
 
-If the shipping algorithm needs to change, nothing in `presentation/` should care. If PostgreSQL is swapped out, `domain/` doesn't notice.
+Both reps could've received a valid *quote* for 8 units — quotes read stock without locking anything, because they don't change anything. Only one of them can actually get 8 units, and the system tells the loser exactly why, rather than silently overselling or throwing a generic 500.
 
-## Design decisions that matter
+### Key design decisions
 
-### The greedy allocation is provably optimal — for this tariff
+**A quote is a guess; a submission is a promise.** Quoting reads current stock and shows you what *would* happen. It doesn't reserve anything, because reserving stock for a sales rep who's still on the phone with a customer creates its own headaches (what if they never call back?). Submission is where correctness has to actually hold, so it recalculates everything against locked, current stock inside one transaction.
 
-```text
-shipping cost per device = distanceKm × 0.365 kg × $0.01/(kg·km)
-```
+**The transaction boundary is the whole warehouse table, not just the rows being touched.** Submission locks all six warehouse rows, in ascending ID order, before doing anything else. That last part — the fixed lock order — is what stops two concurrent submissions from deadlocking each other by grabbing the same two warehouses in opposite order. Locking all six instead of just the ones an order touches is the simplest thing that's obviously correct; it does serialize submissions against each other, which is a real throughput ceiling I'm accepting on purpose rather than by accident.
 
-Cost per unit is fixed per warehouse and purely linear in quantity, with zero cost for touching an additional warehouse. The allocator computes Haversine distance to all six, sorts by distance (warehouse ID breaks ties), and fills from the cheapest first. **Exchange argument**: if any valid plan uses a pricier warehouse while a cheaper one still has stock, moving one unit from the pricier to the cheaper warehouse strictly reduces cost without changing the total shipped. Repeat until no such pair exists, and you've reached the minimum. That's **O(W log W)** time, **O(W)** space — this depends entirely on the tariff being linear with no per-shipment fee; a flat fee per warehouse touched turns this into a knapsack-flavoured problem and greedy stops being optimal.
+**Money lives in integer cents, always.** Floating point and currency don't mix — ask anyone who's had a shopping cart total off by a cent. Distance math still uses floating point (you can't avoid it for Haversine), but each warehouse's shipping charge gets rounded to the cent *before* being summed, and the 15% ceiling itself is rounded down rather than up, so a fractional cent can never sneak an order across the validity line.
 
-### A quote is a simulation; a submission is a transaction
+**Why PostgreSQL, specifically.** This problem is fundamentally about correctness under concurrency — I needed real transactions, row-level locking, and `SELECT ... FOR UPDATE`, not eventual consistency and a promise it'll sort itself out. A relational database with proper ACID guarantees was the only honest choice for "don't oversell the last device."
 
-A quote reads current stock and shows what *would* happen — it changes nothing and can go stale the instant someone else orders the last unit. Submission is where correctness actually has to hold: one PostgreSQL transaction that locks all six warehouse rows in ascending ID order, recalculates pricing and allocation against the now-locked stock, and only then writes the order, its allocations, inventory deductions, an audit record, and an outbox event. Commit or nothing.
+**Why a modular monolith, not microservices.** Six warehouses and one product is not a scale problem — it's a correctness and clarity problem. Splitting this into services would mean distributed transactions for something that fits comfortably in one PostgreSQL transaction today, plus network calls and retry logic replacing what is currently a function call. The internal boundaries (domain / application / infrastructure) are real, though, so if this genuinely needed to scale out later, the seams already exist.
 
-Locking every warehouse row per submission is the simplest correct thing that could work, and it serializes submissions against each other — an explicit throughput trade-off, not an oversight. Quotes stay lock-free reads. Ascending-ID lock order is what prevents two concurrent submissions from deadlocking each other over the same two warehouses.
+### Core algorithms & patterns
 
-An `Idempotency-Key` header covers the case where an order succeeds but the HTTP response gets lost: an identical retry replays the stored order; reusing the key with different input returns `409`. That guarantee is per-key, not per-caller — see [Known limitations](#known-limitations).
-
-### Orders are snapshots, not live pointers
-
-Money is integer cents throughout; each warehouse's shipping charge is rounded to the cent *before* summing, and the 15% ceiling is rounded down so rounding can never let a borderline order sneak through. Everything used to price an order — unit price, discount tier, shipping rate, the threshold itself — is copied onto the order row at submission time, and `order_allocations` preserves exactly which warehouses shipped what, at what distance and cost. Change the price table next week and every historical order still reads back exactly as it was confirmed.
-
-## Data model
+**Cheapest-first allocation, proven optimal (for this tariff).** Shipping cost per device from a given warehouse is:
 
 ```text
-products            One row: the SCOS Station P1 Pro. Price and weight, not hardcoded constants.
-warehouses           Six rows: location and live stock.
-pricing_rules        Discount tiers and shipping tariff as data, not code — versioned by is_active + created_at.
-orders               One row per submission: full pricing/shipping snapshot, order number, idempotency key.
-order_allocations    Per-warehouse breakdown of a committed order: quantity, distance, cost.
-idempotency_keys     Claims a key to one order id, so a concurrent duplicate resolves instead of racing.
-inventory_audit_log  Every stock delta, signed with a reason and (self-reported) sales rep id.
-outbox_events        Pending domain events for eventual external publication (see below).
+distanceKm × 0.365 kg × $0.01/(kg·km)
 ```
 
-`order_allocations` exists because "shipping cost: $427" isn't very useful to anyone actually fulfilling the order if you can't say which 120 units came from where.
+That's a fixed, linear cost per unit, per warehouse. The allocator computes the Haversine distance to all six warehouses, sorts by distance, and fills the order from the cheapest warehouse first, then the next, until the quantity's met. Warehouse ID breaks distance ties. That's it — no search, no optimization solver.
 
-## API
+Is greedy actually optimal here? Yes, and the proof is a one-line exchange argument: if any valid allocation ships from a pricier warehouse while a cheaper one still has stock, moving a unit from the pricier one to the cheaper one strictly lowers total cost without changing how many units shipped. Repeat that swap until no such pair exists, and you've found the cheapest possible allocation. Runs in **O(W log W)** time for `W` warehouses — the sort dominates. This falls apart the moment shipping stops being linear — say, a flat $5 handling fee per warehouse touched — at which point it becomes a variant of facility location / knapsack, and greedy is no longer guaranteed optimal. `IFulfillmentOptimizer` exists as an interface specifically so that swap wouldn't require touching anything else.
 
-Business endpoints and `/docs` require `Authorization: Bearer <API_TOKEN>` (constant-time comparison, one shared token — see [Known limitations](#known-limitations)); `/health` and `/ready` are public.
+**Patterns doing real work, not resume padding:**
+- **Repository pattern** (`IWarehouseRepository`, `IOrderRepository`, `IProductRepository`, `IPricingRuleRepository`) — the domain asks for data through interfaces it owns; PostgreSQL adapters implement them. Swapping the database means writing new adapters, not touching a single use case.
+- **Strategy pattern** (`IFulfillmentOptimizer`) — the allocation algorithm is pluggable by design, for the reason above.
+- **Unit of Work** (`IOrderUnitOfWork`) — submission's entire transaction (lock warehouses, recalculate, save order, deduct stock, write audit log, queue an event) is expressed as one unit that commits or rolls back atomically.
+- **Transactional outbox** — order events are written to an `outbox_events` table in the *same* transaction as the order itself, so "the order saved but the event didn't fire" can't happen. A separate dispatcher drains it with retries and `FOR UPDATE SKIP LOCKED` so multiple workers don't double-publish.
+- **Idempotency keys** — a client-supplied key plus a fingerprint of the request lets a submission retry (say, after a dropped connection) return the original result instead of creating a second order.
 
-| Method & path | Purpose |
-| --- | --- |
-| `POST /v1/order-quotes` | Quote an order without side effects |
-| `POST /v1/orders` | Submit and commit an order (supports `Idempotency-Key`) |
-| `GET /v1/orders/:orderNumber` | Retrieve a committed order |
-| `GET /api/v1/warehouses` | Current stock per warehouse |
-| `GET /api/v1/alerts/stock` | Warehouses at or below 50 units |
-| `GET /metrics` | Prometheus-formatted counters and stock gauges |
-| `GET /health`, `GET /ready` | Liveness / readiness (public) |
-| `GET /docs`, `GET /docs/json` | Swagger UI / OpenAPI spec |
+### Data model
 
-Errors follow `application/problem+json` (RFC 7807 shape): `type`, `title`, `status`, `detail`.
+```text
+products             One row: the SCOS Station P1 Pro. Price and weight, not a hardcoded constant.
+warehouses            Six rows: location and live stock.
+pricing_rules         Discount tiers and the shipping tariff, as data, not code.
+orders                One row per submission — a full pricing/shipping snapshot, not a pointer to current prices.
+order_allocations     Per-warehouse breakdown of a committed order: quantity, distance, cost.
+idempotency_keys      Claims a key to one order id, so a concurrent duplicate resolves cleanly instead of racing.
+inventory_audit_log   Every stock change, signed with a reason and a (self-reported) sales rep id.
+outbox_events         Pending domain events, waiting for a publisher that doesn't exist yet (more on that below).
+```
 
-## Known limitations
+`order_allocations` exists because "shipping cost: $427" is useless to a fulfillment team if nobody can say which 120 units are supposed to come from where. And `orders` stores a full snapshot — unit price, discount tier, shipping rate, the threshold itself — precisely so that changing prices next quarter doesn't rewrite history. An order confirmed in September should still read exactly the way it did in September, forever.
 
-Deliberate scope cuts and gaps worth being explicit about:
+### Tradeoffs & assumptions
 
-- **The shared bearer token is a trust boundary, not identity.** `x-sales-rep-id` is a client-supplied header written straight into the audit log with no verification — anyone holding the one token can attribute an order to any rep string. Fine for a demo; not fine once there's more than one caller who might lie.
-- **Idempotency keys are global, not per-caller, with two different failure modes depending on what collides.** The key is matched against a fingerprint of `(quantity, coordinates, salesRepId)`. If two callers reuse the same key with a *matching* fingerprint (same input, same or both-omitted `salesRepId`), the second caller silently receives the first caller's order back as a successful "replayed" response — not an error, and nothing distinguishes it from having submitted that order themselves. Only a fingerprint *mismatch* on a reused key returns `409 IDEMPOTENCY_CONFLICT`. There's currently no caller identity to scope keys by — see the point above.
-- **No rate limiting.** A leaked token allows unbounded quote/order traffic today.
-- **No CORS policy or security-header middleware.** Reasonable for a token-gated backend API with no browser client, but not a decision I want to leave implicit.
-- **No inventory reservation during a quote.** Intentional — quotes are advisory by design — but worth stating plainly.
-- Haversine distance, not carrier routing; one product, not a catalog. Both match the brief; a real multi-product system needs order lines and inventory keyed by product *and* warehouse.
+A short, honest list, so none of this reads as something I overlooked:
+
+- **Haversine distance, not carrier routing.** Great-circle distance is a reasonable proxy for "how far away is this warehouse," but it's not what a truck or plane actually drives/flies. Matches the brief; a real logistics system would want carrier-quoted rates.
+- **Quotes don't reserve stock**, on purpose — see "a quote is a guess" above. It also means a quote can go stale the instant someone else submits.
+- **The greedy allocator assumes a linear shipping cost with zero fixed cost per warehouse.** True today, false the moment ScreenCloud negotiates a flat per-shipment handling fee.
+- **Locking all six warehouses on every submission is the right call at this scale**, and probably the wrong call at fifty thousand warehouses. I'd revisit it if — and only if — real contention numbers said so; guessing at a more complex scheme now would just be adding risk for a problem that doesn't exist yet.
+- **One product.** Multi-product support needs order lines and stock keyed by product *and* warehouse, not just warehouse. Not hard, just genuinely out of scope for "one SCOS device, six warehouses."
+
+## CI/CD & infrastructure
+
+```text
+GitHub push/PR to main
+        │
+        ▼
+  GitHub Actions CI  ──  tests (Node 22 & 24) · typecheck · Docker build
+        │
+        ▼
+  Deploy (manual trigger, main only)
+        │  OIDC — no long-lived AWS keys anywhere
+        ▼
+  Pulumi  ──  builds + pushes image to ECR, updates the stack
+        │
+        ▼
+Client --HTTPS--> API Gateway --VPC Link--> private ALB --HTTP--> Fargate task --> RDS PostgreSQL
+```
+
+CI (`ci.yml`) runs on every push and PR against `main`: the test suite against a real PostgreSQL container on both Node 22 and 24, a full typecheck, and a Docker build. The **Deploy** workflow is manual (`workflow_dispatch`, `main` only) — it re-runs those same checks, authenticates to AWS over OIDC, runs `pulumi preview` then `pulumi up`, confirms the running ECS task actually matches the image that was just published, and then runs a real smoke test against the live URL: readiness, that auth is actually enforced, a real quote, a real order submission, an idempotent retry, retrieval, and the OpenAPI document. If that smoke test fails, the workflow fails — a green run means the thing is genuinely up, not just that Pulumi didn't error.
+
+Pulumi provisions ECR, an API Gateway HTTP API, a private Application Load Balancer, one Fargate task, a private single-AZ RDS PostgreSQL instance, CloudWatch logs, and Secrets Manager entries for the database URL and API token. **API Gateway is what gives this real HTTPS** — its own `execute-api.amazonaws.com` certificate, with zero domain purchase or DNS setup — and it reaches the ALB privately through a VPC Link, so the load balancer itself is never exposed to the internet directly. One Fargate task and a single-AZ database trade redundancy for cost, deliberately, for a graded demo — this isn't the shape I'd pick for something serving real customers.
+
+### The deploy did not go smoothly, and I think that's worth being honest about
+
+In the interest of not pretending everything just worked on the first try: getting this actually live on AWS surfaced four completely real, completely unglamorous problems, in order —
+
+1. **RDS refused to create** because the AWS account was still on Free Tier, which caps automated backup retention below the general 1–35 day range I'd set. Fixed by upgrading the account to pay-as-you-go, not a code change — the config was already reasonable, the account tier wasn't.
+2. **CloudFront was my first choice** for free HTTPS with no domain — until AWS rejected `CreateDistribution` outright with "your account must be verified," a manual, no-ETA support gate on newer accounts. Rather than block the whole submission on an AWS Support ticket, I swapped it for **API Gateway + VPC Link**, which gets the same result (public HTTPS, private origin, no domain) without that gate.
+3. **A cancelled deploy left a stale lock** on the Pulumi state file, and a separate interrupted image push left Pulumi believing an image existed in ECR that had actually never finished uploading. Both are exactly the kind of state-vs-reality drift that distributed infrastructure tooling occasionally produces — resolved by clearing the lock and dropping the stale resource from state so the next run rebuilt it for real.
+4. **The container crash-looped in production** because the configured API token was shorter than the 32-character minimum the app itself enforces on startup — a real guard doing exactly its job, just against a bad config value.
+
+None of these were code design flaws — they were real infrastructure quirks, and diagnosing "why is this actually broken" via ECS task logs and target-group health rather than guessing is, if anything, a better demonstration of the job than a deploy that happened to work first try.
 
 ## Testing strategy
 
 ```text
-Unit          discount tiers, distance math, allocation, validity boundaries — no I/O
-Integration   real PostgreSQL: HTTP → persistence → response, migrations, outbox
-Concurrency   two connection pools racing the same warehouse; opposing-warehouse-preference
-              deadlock; concurrent idempotent duplicates; concurrent outbox drain with
-              FOR UPDATE SKIP LOCKED; concurrent migrations on overlapping startups
+Unit           discount tiers, Haversine distance, allocation, validity boundaries — no I/O, fast
+Integration    real PostgreSQL: HTTP request → persistence → response, migrations, outbox draining
+Concurrency    two independent connection pools racing the same warehouse, an opposing-warehouse-
+               preference deadlock check, concurrent idempotent duplicates, concurrent outbox
+               drain via FOR UPDATE SKIP LOCKED, concurrent migrations on overlapping startups
 ```
 
-The concurrency tests use genuinely separate connection pools racing each other, not mocked locks — that's where an in-memory allocator would lie to you about correctness.
+The concurrency tests are the ones I actually care about, because they're the ones a mocked-lock unit test would happily lie to you about. They use genuinely separate connection pools racing each other against real PostgreSQL — not a single in-process mutex pretending to be a database.
 
-## Run locally
-
-You need Git and a running Docker engine with Docker Compose v2. The Docker setup runs both the API and PostgreSQL; it needs no AWS or Pulumi setup and no local Node.js installation. Keep ports **3000** and **5432** available. Commands below use a macOS/Linux shell or WSL.
-
-### 1. Get the code and local settings
+Run them:
 
 ```sh
-git clone https://github.com/heisenberg967/scloudoms.git
-cd scloudoms
-cp .env.example .env
+docker compose up -d --wait postgres
+npm ci
+npm test        # everything
+npm run test:unit   # just the fast ones, no database needed
+npm run lint         # typecheck, app and tests both
 ```
 
-If you already have the code, start in the project root and create `.env` only if it does not exist. The example values work as supplied for local development. `.env` is ignored by Git; its sample password and token must not be used for a public deployment.
+## API
 
-### 2. Start the application
+The three that matter:
+
+```text
+POST /v1/order-quotes        simulate an order, no side effects
+POST /v1/orders               submit and commit an order, deducts inventory
+GET  /v1/orders/:orderNumber  retrieve a committed order
+```
+
+**`POST /v1/order-quotes`**
+Request: `{ quantity, customerCoordinates: { latitude, longitude } }`.
+Response: price, discount tier and amount, per-warehouse shipping allocation, total shipping cost, and `isValid`.
+Fails with `400` on bad input (bad coordinates, non-positive quantity) — never touches inventory either way.
+
+**`POST /v1/orders`**
+Same request shape, plus optional `Idempotency-Key` and `x-sales-rep-id` headers.
+Success returns `201` with an `orderNumber` and the same pricing/shipping breakdown as the quote, now committed. A replayed idempotent request returns `200` with the original order instead of creating a second one.
+Fails with `409 INSUFFICIENT_STOCK` if the network doesn't have enough units, `422` if shipping exceeds the 15% ceiling, and `409 IDEMPOTENCY_CONFLICT` if the same key is reused with genuinely different input.
+
+**`GET /v1/orders/:orderNumber`**
+Returns the order exactly as it was confirmed — the historical snapshot, not a live recalculation. `404` if it doesn't exist.
+
+Everything else, briefly:
+
+| Method & path | What it's for |
+| --- | --- |
+| `GET /api/v1/warehouses` | Current stock per warehouse |
+| `GET /api/v1/alerts/stock` | Warehouses at or below 50 units |
+| `GET /metrics` | Prometheus-formatted counters and stock gauges |
+| `GET /health`, `GET /ready` | Liveness / readiness — the only public routes |
+| `GET /docs`, `GET /docs/json` | Swagger UI / raw OpenAPI spec |
+
+All business routes and `/docs` require `Authorization: Bearer <token>`, checked with a constant-time comparison so response timing can't leak anything about the token. Errors come back as `application/problem+json` (RFC 7807: `type`, `title`, `status`, `detail`), consistently, everywhere.
+
+## Future scope
+
+### How this could fit into ScreenCloud
+
+Nothing here is speculation about ScreenCloud's actual internal architecture — just the obvious shape this slots into. An internal sales tool could point at this API today, as-is. The domain logic is deliberately isolated from HTTP and persistence, so it could sit behind a CRM integration, an internal sales UI, or both, without the pricing/allocation logic caring which.
+
+The transactional outbox is the other half of that story: order events are already being written, in-transaction, with nowhere configured to send them yet. Wire up a real publisher and you get a path to warehouse fulfillment systems or a data warehouse without adding any risk to order submission itself, since the event write already happened atomically with the order.
+
+### What I'd actually build for analytics/reporting
+
+Once order events are flowing somewhere, the obvious next questions become easy to answer:
+
+- Order volume and revenue, over time and by region
+- Fulfillment split by warehouse — which ones are actually doing the work
+- Average shipping cost as a percentage of order value — is the 15% ceiling rejecting a meaningful chunk of demand?
+- Invalid-order rate and *why* orders are failing (stock vs. shipping cost)
+- Stock depletion trends per warehouse, to catch a restock need before `/api/v1/alerts/stock` would
+- Regional demand patterns — useful input for "should there be a seventh warehouse, and where"
+
+None of this needs new instrumentation in the hot path. It's a consumer reading the same events that already exist.
+
+### Hardening this for real production use
+
+The brief explicitly asked what I'd do next if this were a real project, so here it is, roughly in priority order:
+
+1. **Replace the shared bearer token with real identity.** Right now, `x-sales-rep-id` is a client-supplied header trusted straight into the audit log with zero verification — anyone holding the one token can attribute an order to any name they like. Fine for a demo; not fine the moment there's more than one trusted caller.
+2. **Scope idempotency keys per caller**, once there's a caller identity to scope them by. Right now two reps who both pick the same natural key (`"order-1"`) and submit identical input will have the *second* one silently receive the *first* one's order back as a successful "replay" — not an error, no signal anything's off. A genuine fingerprint mismatch on a reused key correctly returns `409`, but the matching case needs a caller dimension that doesn't exist yet.
+3. **Rate limiting.** There isn't any today. A leaked token currently means unbounded quote/order traffic.
+4. **A real runtime database role**, separate from the one that runs migrations, plus an actual proven backup-restore drill rather than "RDS backups are probably fine."
+5. **Real monitoring** — request latency, lock-wait time, an outbox-backlog alarm. The current Prometheus counters are a start, not a monitored production system.
+6. **Load-test before touching the locking strategy.** Locking all six warehouses on every submission is deliberately simple and serializes submissions against each other. I'd only make it more complex if real contention numbers said the throughput ceiling was actually a problem — not before.
+
+---
+
+## Local development, in full
+
+Everything above got you a running system; this section is the reference for the rest of it.
+
+### Stop, inspect, reset
 
 ```sh
-docker compose up --build -d --wait
-curl --fail http://localhost:3000/ready
+docker compose logs --tail=100 app postgres   # diagnose a startup or request failure
+docker compose down                            # stop containers, keep the data
+docker compose down --volumes                  # nuke the database and start fresh next time
 ```
 
-The readiness response should contain `"status":"READY"` and `"database":"CONNECTED"`. Startup creates the schema and seeds the product, pricing rules, and six warehouses automatically. No separate migration or seed command is needed.
+Orders and stock persist in a Docker volume across restarts — a restart doesn't replenish inventory, only `--volumes` does.
 
-### 3. Try the API
+### Live reload for actually editing code
 
-The API is at **http://localhost:3000**. Health endpoints are public; business endpoints and documentation require the `API_TOKEN` from `.env`. This request uses the supplied development token; replace the header value if you changed it:
-
-```sh
-curl --fail-with-body http://localhost:3000/v1/order-quotes \
-  -H 'Authorization: Bearer local-development-token-change-before-deployment' \
-  -H 'Content-Type: application/json' \
-  -d '{"quantity":30,"customerCoordinates":{"latitude":40.7128,"longitude":-74.006}}'
-```
-
-The response includes pricing, warehouse allocation, shipping, and `isValid`, without changing inventory. To submit, send the same request to `/v1/orders` with `-H 'Idempotency-Key: local-order-1'`. This deducts stock and returns an `orderNumber`, which you can retrieve at `/v1/orders/:orderNumber` with the same authorization header. An identical retry with the same key returns the existing order.
-
-Other endpoints include `/api/v1/warehouses` for stock, `/api/v1/alerts/stock` for low-stock warehouses, `/metrics`, and `/docs/json` for OpenAPI. Swagger UI at `/docs/` also requires the authorization header; see the development option below for ordinary browser access.
-
-### Stop, inspect, or reset
-
-```sh
-docker compose logs --tail=100 app postgres  # Diagnose startup or request failures
-docker compose down                        # Stop containers; keep database contents
-```
-
-Orders and stock persist in a Docker volume across restarts. To deliberately **delete all local database contents**, run `docker compose down --volumes`, then repeat the startup command to get fresh seed data.
-
-### Develop with live reload
-
-For editing code, install **Node.js 22.14+ and npm**. After the clone and `.env` steps above, run PostgreSQL in Docker and the API on your machine:
+Needs Node.js 22.14+ and npm, on top of the Docker/`.env` setup above:
 
 ```sh
 docker compose stop app
@@ -193,60 +342,33 @@ npm ci
 HOST=127.0.0.1 npm run dev
 ```
 
-The API reloads when source files change. The npm scripts load `.env` automatically; `DATABASE_URL` connects to PostgreSQL on localhost. Stop the API with Ctrl+C. To run the compiled application instead, use `npm run build && HOST=127.0.0.1 npm start`.
+The dev server reloads on file changes and reads `.env` automatically. Stop it with Ctrl+C. `npm run build && HOST=127.0.0.1 npm start` runs the compiled version instead.
 
-For local Swagger UI access without a header-injecting client, stop the development server and run `HOST=127.0.0.1 API_TOKEN= npm run dev`, then open **http://localhost:3000/docs/**. This explicitly disables authentication for the development server bound to localhost; the Docker configuration continues to require a token.
+### Viewing Swagger UI without a header-injecting client
 
-## Test it
+Every business route (including `/docs`) requires the bearer token — a plain browser tab can't send that header on its own. Two ways around it:
 
-With Node.js 22.14+ installed and `.env` created as above, run from the project root:
+- **Locally**: stop the dev server and run `HOST=127.0.0.1 API_TOKEN= npm run dev`, then open `http://localhost:3000/docs/` in an ordinary browser tab. This disables auth entirely for a server explicitly bound to localhost — the Docker setup keeps requiring the token regardless.
+- **Against a real deployment** (where you can't just turn auth off): a header-injecting browser extension like ModHeader or Requestly, configured to add `Authorization: Bearer <token>` to requests matching that host. Watch out for extensions that only modify XHR/fetch by default and skip the top-level page navigation — that's the request that actually loads `/docs/`, so it needs to be included too.
+
+### Deploying it yourself
+
+One-time setup needs an AWS account, an S3 bucket for Pulumi state (name must start with `scos-pulumi-state-` to match [the deployer policy](infra/iam/sc-deployer-policy.json)), an OIDC trust relationship for GitHub Actions, and a `demo` Pulumi stack configured with a database password and API token (32+ characters, non-negotiable — the app refuses to start in production without it):
 
 ```sh
-docker compose up -d --wait postgres
-npm ci
-npm test
-npm run lint
+cd infra/pulumi
+pulumi stack select demo
+pulumi config set aws:region us-east-1
+pulumi config set --secret dbPassword
+pulumi config set --secret apiToken
 ```
 
-The API does not need to be running. Tests use `TEST_DATABASE_URL` from `.env` and create isolated schemas in PostgreSQL, leaving application orders and stock untouched. Unavailable PostgreSQL fails the integration suite. `npm run test:unit` runs only the unit tests and needs no database.
-
-## Deployment
-
-Cloud hosting and CI/CD are explicitly optional for this challenge — everything above stands on its own via Docker Compose. This section exists to show the design, not to compensate for a weak local story.
-
-```text
-Client --HTTPS--> API Gateway --HTTP via VPC Link--> private ALB --HTTP--> Fargate task --> RDS PostgreSQL
-```
-
-GitHub Actions runs CI (Postgres-backed tests on Node 22 & 24, typecheck, Docker build) on pushes to `main` and on pull requests targeting it — a push to a feature branch alone doesn't trigger it. A manual **Deploy** workflow (`workflow_dispatch`, `main` only) authenticates to AWS via OIDC — no long-lived AWS keys in GitHub — and runs Pulumi against a single `demo` stack with state in a private S3 bucket:
-
-1. Re-run CI checks.
-2. Assume the deployment role via OIDC.
-3. `pulumi preview`, then `pulumi up` — builds and publishes the Docker image to ECR, deploys its digest to one Fargate task.
-4. Confirm the running task definition matches the published image digest.
-5. Run `scripts/smoke.mjs` against the live URL: readiness, auth rejection, a real quote, a real order submission, an idempotent retry, retrieval, and the OpenAPI document.
-
-Pulumi provisions ECR, an API Gateway HTTP API, a private ALB, one Fargate task, private single-AZ RDS PostgreSQL, CloudWatch logs, and Secrets Manager entries for the database URL and API token. **API Gateway terminates HTTPS** on its own generated `execute-api.amazonaws.com` certificate — no domain purchase or DNS zone needed — and reaches the ALB over plain HTTP through a VPC Link; the ALB itself only accepts traffic from the VPC Link's security group. The Fargate task sits in a public subnet with inbound access restricted to the ALB's security group, which avoids paying for a NAT gateway while keeping the task's only inbound path through the load balancer. One task and a single-AZ database trade redundancy for cost, deliberately, for a graded demo.
-
-An earlier version of this put CloudFront in front of the ALB instead, for the same reason (free HTTPS with no domain). It was abandoned mid-deployment: AWS rejected `CreateDistributionWithTags` with `AccessDenied: Your account must be verified before you can add new CloudFront resources`, a manual account-verification gate on new/recently-changed accounts with no defined turnaround time. API Gateway's HTTP API + VPC Link gives the same result — a public HTTPS endpoint with an AWS-issued certificate over a private origin — without that gate.
-
-**Access model:** the deployed API is authenticated the same way as local — one bearer token, checked with a constant-time comparison. The token is stored encrypted in `infra/pulumi/Pulumi.demo.yaml` (safe to commit — Pulumi decrypts it with a stack passphrase that isn't in the repo) and injected into the running task via Secrets Manager; that authentication check, not the URL, is what actually protects the deployment. The API Gateway URL itself isn't secret — anyone who has it and a valid token can call it. I'm not publishing the URL or a live token in this README simply so the public repo doesn't invite unsolicited traffic against a resource-limited, real-money demo account; ask and I'll share both directly.
-
-**Status as of this submission:** GitHub Actions repository variables/secrets (`AWS_ROLE_ARN`, `PULUMI_BACKEND_URL`, `PULUMI_CONFIG_PASSPHRASE`) are set, and the OIDC trust and deployer role exist in AWS. The deployer IAM *policy document* in this repo (`infra/iam/sc-deployer-policy.json`) was updated for the API Gateway/VPC Link resources added above, but editing that file doesn't update AWS by itself — the live policy attached to the role needs to be synced to it before a deploy using it will succeed. Treat "deployed and verified" as a status to confirm at review time, not assume from this document.
-
-## What I'd do next
-
-If this graduated from challenge to real project, roughly in order of urgency:
-
-- **Identity and permissions** — replace the shared token with the company identity provider, authorize sales/ops roles, and derive `sales_rep_id` from a verified claim instead of a client-supplied header.
-- **Rate limiting** on the API, now that there's a plan for who's allowed to call it and how much.
-- **Idempotency keys scoped per caller** once there's a caller identity to scope them by.
-- **Database operations** — a restricted runtime DB role separate from the migration role, and a proven backup-restore drill, before trusting this with real inventory.
-- **Monitoring** — request latency and lock-wait histograms, dashboards, alert routing, and an outbox-backlog alarm; the current counters and stock gauges are a start, not a monitored production deployment.
-- **Capacity** — load-test representative quote/submit traffic and set connection-pool budgets and timeouts from real numbers, rather than the current "lock all six warehouses" default. Revisit that locking strategy only if measured contention justifies something more complex.
-- **An external event publisher** for the outbox (currently events sit `PENDING` — the dispatcher, retries, and at-least-once delivery all work, there's just nowhere configured to send them yet). That unlocks warehouse fulfillment, conversion analytics, or a data warehouse feed without touching order submission.
-- **Multi-product support** if the catalog ever grows past one SKU — needs order lines and inventory keyed by product *and* warehouse, not just warehouse.
+Those last two prompt without touching shell history, and the encrypted result is safe to commit — `Pulumi.demo.yaml` holds AES-256-GCM ciphertext, not plaintext, decryptable only with a passphrase that never touches the repo (it lives in GitHub's `PULUMI_CONFIG_PASSPHRASE` secret and your own password manager). From there, GitHub Actions → **Deploy** → **Run workflow** on `main` does the rest.
 
 ## Tech stack
 
-TypeScript · Node.js · Fastify · PostgreSQL (`postgres` driver, hand-written SQL and migrations) · Zod · Vitest · Docker · Pulumi · AWS (ECS Fargate, RDS, ALB, API Gateway, ECR, Secrets Manager) · GitHub Actions
+TypeScript · Node.js · Fastify · PostgreSQL (`postgres` driver, hand-written SQL and migrations — no ORM) · Zod · Vitest · Docker · Pulumi · AWS (ECS Fargate, RDS, ALB, API Gateway, ECR, Secrets Manager) · GitHub Actions
+
+### A note on how this was built
+
+I used Codex and Claude Code throughout this project — for scaffolding, for a second-pass code review that caught real bugs, and for working through the AWS deployment saga in the CI/CD section. It's still remarkable to me how much AI has changed the day-to-day of building software! 🙂
