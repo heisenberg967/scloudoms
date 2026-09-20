@@ -94,31 +94,11 @@ export interface IFulfillmentOptimizer {
  * the global minimum in O(M log M) time and O(M) space.
  */
 export class FulfillmentOptimizer implements IFulfillmentOptimizer {
-  public optimizeFulfillment(
-    quantity: number,
-    destination: Coordinates,
-    warehouses: readonly Warehouse[],
-    netTotal: Money,
-    shippingRatePerKgKm: number = SHIPPING_RATE_PER_KG_KM,
-    maxShippingCostRatio: number = MAX_SHIPPING_COST_RATIO_OF_NET_TOTAL,
-    unitWeightKg: number = SCOS_STATION_P1_PRO.unitWeightKg
-  ): FulfillmentPlan {
-    return FulfillmentOptimizer.optimizeFulfillment(
-      quantity,
-      destination,
-      warehouses,
-      netTotal,
-      shippingRatePerKgKm,
-      maxShippingCostRatio,
-      unitWeightKg
-    );
-  }
-
   /**
    * Computes the globally optimal (cost-minimizing) warehouse allocation plan
    * to fulfill an order of a given quantity to the destination coordinates.
    */
-  public static optimizeFulfillment(
+  public optimizeFulfillment(
     quantity: number,
     destination: Coordinates,
     warehouses: readonly Warehouse[],

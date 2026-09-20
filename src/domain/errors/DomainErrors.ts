@@ -67,6 +67,16 @@ export class IdempotencyConflictError extends DomainError {
     );
   }
 }
+export class PricingRuleNotConfiguredError extends DomainError {
+  readonly code = 'PRICING_RULE_NOT_CONFIGURED';
+  readonly statusCode = 500;
+  constructor() {
+    super(
+      'No active pricing rule is configured. Pricing and shipping cannot be evaluated safely.'
+    );
+  }
+}
+
 export class ServiceBusyError extends DomainError {
   readonly code = 'SERVICE_BUSY';
   readonly statusCode = 503;

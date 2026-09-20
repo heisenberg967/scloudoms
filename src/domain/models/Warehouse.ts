@@ -35,10 +35,6 @@ export class Warehouse {
     return this._updatedAt;
   }
 
-  public hasSufficientStock(quantity: number): boolean {
-    return this._stock >= quantity;
-  }
-
   public deductStock(quantity: number): void {
     if (quantity < 0) {
       throw new Error(`Cannot deduct negative quantity: ${quantity}`);
@@ -49,14 +45,6 @@ export class Warehouse {
       );
     }
     this._stock -= quantity;
-    this._updatedAt = new Date();
-  }
-
-  public restoreStock(quantity: number): void {
-    if (quantity < 0) {
-      throw new Error(`Cannot restore negative quantity: ${quantity}`);
-    }
-    this._stock += quantity;
     this._updatedAt = new Date();
   }
 
