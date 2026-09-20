@@ -12,7 +12,7 @@
         "rds:*",
         "logs:*",
         "secretsmanager:*",
-        "cloudfront:*"
+        "apigateway:*"
       ],
       "Resource": "*"
     },
@@ -97,16 +97,14 @@
       "Resource": [
         "arn:aws:iam::*:role/aws-service-role/ecs.amazonaws.com/*",
         "arn:aws:iam::*:role/aws-service-role/elasticloadbalancing.amazonaws.com/*",
-        "arn:aws:iam::*:role/aws-service-role/rds.amazonaws.com/*",
-        "arn:aws:iam::*:role/aws-service-role/vpcorigin.cloudfront.amazonaws.com/*"
+        "arn:aws:iam::*:role/aws-service-role/rds.amazonaws.com/*"
       ],
       "Condition": {
         "StringEquals": {
           "iam:AWSServiceName": [
             "ecs.amazonaws.com",
             "elasticloadbalancing.amazonaws.com",
-            "rds.amazonaws.com",
-            "vpcorigin.cloudfront.amazonaws.com"
+            "rds.amazonaws.com"
           ]
         }
       }
