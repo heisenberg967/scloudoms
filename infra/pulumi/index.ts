@@ -163,7 +163,12 @@ const vpcOrigin = new aws.cloudfront.VpcOrigin('scos-origin', {
     arn: alb.arn,
     httpPort: 80,
     httpsPort: 443,
-    originProtocolPolicy: 'http-only'
+    originProtocolPolicy: 'http-only',
+    // Required by the provider schema even when the origin uses HTTP only.
+    originSslProtocols: {
+      items: ['TLSv1.2'],
+      quantity: 1
+    }
   }
 }, { dependsOn: [listener] });
 
