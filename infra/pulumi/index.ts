@@ -3,41 +3,12 @@ import * as aws from '@pulumi/aws';
 import * as awsx from '@pulumi/awsx';
 
 const config = new pulumi.Config();
-const domainName = config.require('domainName');
-const hostedZoneId = config.get('hostedZoneId');
-const suppliedCertificateArn = config.get('certificateArn');
 const dbPassword = config.requireSecret('dbPassword');
 const apiToken = config.requireSecret('apiToken');
-if (!suppliedCertificateArn && !hostedZoneId) {
-  throw new Error('Set hostedZoneId for Route 53 validation, or supply an issued certificateArn');
-}
 // Validate the rollback override before registering any resources.
 const imageOverride = config.get('imageUri');
 if (imageOverride && !/@sha256:[a-f0-9]{64}$/.test(imageOverride)) {
   throw new Error('imageUri must reference an immutable sha256 image digest');
-}
-
-// Route 53 can manage validation and API DNS in this deployment. An existing
-// certificate also supports a hostname whose DNS is hosted elsewhere.
-let certificateArn: pulumi.Input<string>;
-if (suppliedCertificateArn) {
-  certificateArn = suppliedCertificateArn;
-} else {
-  const certificate = new aws.acm.Certificate('scos-certificate', {
-    domainName,
-    validationMethod: 'DNS'
-  });
-  const validation = new aws.route53.Record('scos-certificate-validation', {
-    zoneId: hostedZoneId!,
-    name: certificate.domainValidationOptions.apply(options => options[0].resourceRecordName),
-    type: certificate.domainValidationOptions.apply(options => options[0].resourceRecordType),
-    records: [certificate.domainValidationOptions.apply(options => options[0].resourceRecordValue)],
-    ttl: 60
-  });
-  certificateArn = new aws.acm.CertificateValidation('scos-validated-certificate', {
-    certificateArn: certificate.arn,
-    validationRecordFqdns: [validation.fqdn]
-  }).certificateArn;
 }
 
 // Build and publish before ECS starts, including on the first deployment.
@@ -119,15 +90,19 @@ const rdsInstance = new aws.rds.Instance('scos-postgres', {
   skipFinalSnapshot: false
 });
 
-// HTTPS ingress.
+// CloudFront provides public HTTPS; the load balancer stays private.
+const cloudFrontPrefixList = aws.ec2.getManagedPrefixListOutput({
+  name: 'com.amazonaws.global.cloudfront.origin-facing'
+});
+
 const albSecurityGroup = new aws.ec2.SecurityGroup('scos-alb-sg', {
   vpcId: vpc.vpcId,
   ingress: [
     {
       protocol: 'tcp',
-      fromPort: 443,
-      toPort: 443,
-      cidrBlocks: ['0.0.0.0/0']
+      fromPort: 80,
+      toPort: 80,
+      prefixListIds: [cloudFrontPrefixList.id]
     }
   ],
   egress: [
@@ -150,19 +125,10 @@ const albToApp = new aws.ec2.SecurityGroupRule('scos-alb-to-app', {
 });
 
 const alb = new aws.lb.LoadBalancer('scos-alb', {
-  internal: false,
+  internal: true,
   securityGroups: [albSecurityGroup.id],
-  subnets: vpc.publicSubnetIds
+  subnets: vpc.privateSubnetIds
 });
-
-if (hostedZoneId) {
-  new aws.route53.Record('scos-api-dns', {
-    zoneId: hostedZoneId,
-    name: domainName,
-    type: 'A',
-    aliases: [{ name: alb.dnsName, zoneId: alb.zoneId, evaluateTargetHealth: true }]
-  });
-}
 
 const targetGroup = new aws.lb.TargetGroup('scos-tg', {
   port: 3000,
@@ -181,16 +147,75 @@ const targetGroup = new aws.lb.TargetGroup('scos-tg', {
 
 const listener = new aws.lb.Listener('scos-listener', {
   loadBalancerArn: alb.arn,
-  port: 443,
-  protocol: 'HTTPS',
-  certificateArn,
-  sslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
+  port: 80,
+  protocol: 'HTTP',
   defaultActions: [
     {
       type: 'forward',
       targetGroupArn: targetGroup.arn
     }
   ]
+});
+
+const vpcOrigin = new aws.cloudfront.VpcOrigin('scos-origin', {
+  vpcOriginEndpointConfig: {
+    name: `scos-${pulumi.getStack()}`,
+    arn: alb.arn,
+    httpPort: 80,
+    httpsPort: 443,
+    originProtocolPolicy: 'http-only'
+  }
+}, { dependsOn: [listener] });
+
+const cachingDisabled = aws.cloudfront.getCachePolicyOutput({
+  name: 'Managed-CachingDisabled'
+});
+
+const forwardRequests = aws.cloudfront.getOriginRequestPolicyOutput({
+  name: 'Managed-AllViewerExceptHostHeader'
+});
+
+const distribution = new aws.cloudfront.Distribution('scos-api', {
+  enabled: true,
+  isIpv6Enabled: true,
+  waitForDeployment: true,
+  priceClass: 'PriceClass_100',
+  origins: [{
+    originId: 'scos-api',
+    domainName: alb.dnsName,
+    vpcOriginConfig: {
+      vpcOriginId: vpcOrigin.id
+    }
+  }],
+  defaultCacheBehavior: {
+    targetOriginId: 'scos-api',
+    viewerProtocolPolicy: 'https-only',
+    allowedMethods: [
+      'GET', 'HEAD', 'OPTIONS', 'PUT', 'POST', 'PATCH', 'DELETE'
+    ],
+    cachedMethods: ['GET', 'HEAD'],
+    cachePolicyId: cachingDisabled.apply(policy => {
+      if (!policy.id) throw new Error('Managed-CachingDisabled policy ID was not returned');
+      return policy.id;
+    }),
+    originRequestPolicyId: forwardRequests.apply(policy => {
+      if (!policy.id) throw new Error('Managed-AllViewerExceptHostHeader policy ID was not returned');
+      return policy.id;
+    }),
+    compress: true
+  },
+  customErrorResponses: [
+    400, 403, 404, 405, 414, 416, 500, 501, 502, 503, 504
+  ].map(errorCode => ({
+    errorCode,
+    errorCachingMinTtl: 0
+  })),
+  restrictions: {
+    geoRestriction: { restrictionType: 'none' }
+  },
+  viewerCertificate: {
+    cloudfrontDefaultCertificate: true
+  }
 });
 
 // Application runtime.
@@ -328,7 +353,7 @@ const fargateService = new aws.ecs.Service(
 
 // Outputs
 export const loadBalancerDnsName = alb.dnsName;
-export const apiUrl = `https://${domainName}`;
+export const apiUrl = distribution.domainName.apply(name => `https://${name}`);
 export const deployedImage = imageUri;
 export const imageRepositoryUrl = repository.repositoryUrl;
 export const databaseEndpoint = rdsInstance.endpoint;

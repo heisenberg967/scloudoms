@@ -26,7 +26,7 @@ data/
 Pulumi.*.yaml
 !infra/pulumi/Pulumi.demo.yaml
 
-# Local editorial notes; the finished README is the project documentation
+# Local documentation and editorial notes
 docs/
 
 # Editor, OS, and temporary files

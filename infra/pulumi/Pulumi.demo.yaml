@@ -1,3 +1,7 @@
 encryptionsalt: v1:pVcI4Lhrma0=:v1:euSugpuTJInfHPTz:9TCS+uDbISBuuD9kObxcTH+uQmRCbg==
 config:
   aws:region: us-east-1
+  screencloud-oms-infra:dbPassword:
+    secure: v1:/AvTCm+ApcN2c/8l:sDZKsdJV+Nf5x8s93LkGjcMNS3tMQQjAvkyRQS1UxBsR3tPV
+  screencloud-oms-infra:apiToken:
+    secure: v1:EKjxZWjQxYJtvz+Y:G68BP+Gnta3wUb+qi6yH31enuDWCYq4uSwgPVDSUqZ36E8gm
