@@ -90,9 +90,18 @@ const rdsInstance = new aws.rds.Instance('scos-postgres', {
   skipFinalSnapshot: false
 });
 
-// CloudFront provides public HTTPS; the load balancer stays private.
-const cloudFrontPrefixList = aws.ec2.getManagedPrefixListOutput({
-  name: 'com.amazonaws.global.cloudfront.origin-facing'
+// API Gateway reaches the load balancer privately through a VPC Link; the
+// load balancer itself accepts traffic only from the VPC Link's security group.
+const vpcLinkSecurityGroup = new aws.ec2.SecurityGroup('scos-vpclink-sg', {
+  vpcId: vpc.vpcId,
+  egress: [
+    {
+      protocol: '-1',
+      fromPort: 0,
+      toPort: 0,
+      cidrBlocks: ['0.0.0.0/0']
+    }
+  ]
 });
 
 const albSecurityGroup = new aws.ec2.SecurityGroup('scos-alb-sg', {
@@ -102,7 +111,7 @@ const albSecurityGroup = new aws.ec2.SecurityGroup('scos-alb-sg', {
       protocol: 'tcp',
       fromPort: 80,
       toPort: 80,
-      prefixListIds: [cloudFrontPrefixList.id]
+      securityGroups: [vpcLinkSecurityGroup.id]
     }
   ],
   egress: [
@@ -157,71 +166,55 @@ const listener = new aws.lb.Listener('scos-listener', {
   ]
 });
 
-const vpcOrigin = new aws.cloudfront.VpcOrigin('scos-origin', {
-  vpcOriginEndpointConfig: {
-    name: `scos-${pulumi.getStack()}`,
-    arn: alb.arn,
-    httpPort: 80,
-    httpsPort: 443,
-    originProtocolPolicy: 'http-only',
-    // Required by the provider schema even when the origin uses HTTP only.
-    originSslProtocols: {
-      items: ['TLSv1.2'],
-      quantity: 1
-    }
-  }
-}, { dependsOn: [listener] });
-
-const cachingDisabled = aws.cloudfront.getCachePolicyOutput({
-  name: 'Managed-CachingDisabled'
+// API Gateway HTTP API gives public HTTPS on its own execute-api.amazonaws.com
+// certificate; a VPC Link reaches the private ALB without exposing it directly.
+const vpcLink = new aws.apigatewayv2.VpcLink('scos-vpc-link', {
+  name: `scos-${pulumi.getStack()}`,
+  subnetIds: vpc.privateSubnetIds,
+  securityGroupIds: [vpcLinkSecurityGroup.id]
 });
 
-const forwardRequests = aws.cloudfront.getOriginRequestPolicyOutput({
-  name: 'Managed-AllViewerExceptHostHeader'
+const httpApi = new aws.apigatewayv2.Api('scos-api', {
+  protocolType: 'HTTP'
 });
 
-const distribution = new aws.cloudfront.Distribution('scos-api', {
-  enabled: true,
-  isIpv6Enabled: true,
-  waitForDeployment: true,
-  priceClass: 'PriceClass_100',
-  origins: [{
-    originId: 'scos-api',
-    domainName: alb.dnsName,
-    vpcOriginConfig: {
-      vpcOriginId: vpcOrigin.id
-    }
-  }],
-  defaultCacheBehavior: {
-    targetOriginId: 'scos-api',
-    viewerProtocolPolicy: 'https-only',
-    allowedMethods: [
-      'GET', 'HEAD', 'OPTIONS', 'PUT', 'POST', 'PATCH', 'DELETE'
-    ],
-    cachedMethods: ['GET', 'HEAD'],
-    cachePolicyId: cachingDisabled.apply(policy => {
-      if (!policy.id) throw new Error('Managed-CachingDisabled policy ID was not returned');
-      return policy.id;
-    }),
-    originRequestPolicyId: forwardRequests.apply(policy => {
-      if (!policy.id) throw new Error('Managed-AllViewerExceptHostHeader policy ID was not returned');
-      return policy.id;
-    }),
-    compress: true
+const integration = new aws.apigatewayv2.Integration(
+  'scos-integration',
+  {
+    apiId: httpApi.id,
+    integrationType: 'HTTP_PROXY',
+    integrationMethod: 'ANY',
+    connectionType: 'VPC_LINK',
+    connectionId: vpcLink.id,
+    integrationUri: listener.arn,
+    payloadFormatVersion: '1.0'
   },
-  customErrorResponses: [
-    400, 403, 404, 405, 414, 416, 500, 501, 502, 503, 504
-  ].map(errorCode => ({
-    errorCode,
-    errorCachingMinTtl: 0
-  })),
-  restrictions: {
-    geoRestriction: { restrictionType: 'none' }
-  },
-  viewerCertificate: {
-    cloudfrontDefaultCertificate: true
-  }
+  { dependsOn: [listener] }
+);
+
+// {proxy+} covers every sub-path; the root route covers "/" itself, which
+// {proxy+} alone does not match.
+const proxyRoute = new aws.apigatewayv2.Route('scos-route-proxy', {
+  apiId: httpApi.id,
+  routeKey: 'ANY /{proxy+}',
+  target: pulumi.interpolate`integrations/${integration.id}`
 });
+
+const rootRoute = new aws.apigatewayv2.Route('scos-route-root', {
+  apiId: httpApi.id,
+  routeKey: 'ANY /',
+  target: pulumi.interpolate`integrations/${integration.id}`
+});
+
+const stage = new aws.apigatewayv2.Stage(
+  'scos-stage',
+  {
+    apiId: httpApi.id,
+    name: '$default',
+    autoDeploy: true
+  },
+  { dependsOn: [proxyRoute, rootRoute] }
+);
 
 // Application runtime.
 const ecsCluster = new aws.ecs.Cluster('scos-cluster', {
@@ -358,7 +351,7 @@ const fargateService = new aws.ecs.Service(
 
 // Outputs
 export const loadBalancerDnsName = alb.dnsName;
-export const apiUrl = distribution.domainName.apply(name => `https://${name}`);
+export const apiUrl = stage.invokeUrl;
 export const deployedImage = imageUri;
 export const imageRepositoryUrl = repository.repositoryUrl;
 export const databaseEndpoint = rdsInstance.endpoint;
