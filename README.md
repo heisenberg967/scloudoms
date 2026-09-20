@@ -1,26 +1,37 @@
 # ScreenCloud Order Management System
 
-A backend for quoting and submitting SCOS device orders. The main challenge is choosing the cheapest warehouse allocation while keeping inventory correct when sales representatives submit orders at the same time.
+A backend for quoting and submitting orders for ScreenCloud's SCOS Station P1 Pro. Creating an order record is the easy part; the interesting part is finding the cheapest way to fulfill it across six warehouses, and keeping inventory correct when two sales reps hit submit on the last few units at the same time.
+
+The goal was to keep the solution simple where the brief allows it, and treat the parts that matter — pricing, allocation, concurrency — like production code.
 
 ## The problem
 
-The challenge specifies one product, the **SCOS Station P1 Pro**, priced at **$150** and weighing **365 g**, stocked across six warehouses. Orders receive the largest qualifying volume discount: **5% at 25 units, 10% at 50, 15% at 100, and 20% at 250**.
+The SCOS Station P1 Pro costs **$150** and weighs **365 g**. Orders qualify for the largest discount they reach: **5% at 25 units, 10% at 50, 15% at 100, 20% at 250**. Stock is spread across six warehouses:
 
-Shipping costs **$0.01 per kilogram per kilometre**. An order can draw stock from several warehouses, but shipping must not exceed **15% of the device total after discount**.
+| Warehouse | Coordinates | Stock |
+| --- | --- | --- |
+| Los Angeles | 33.9425, -118.408056 | 355 |
+| New York | 40.639722, -73.778889 | 578 |
+| São Paulo | -23.435556, -46.473056 | 265 |
+| Paris | 49.009722, 2.547778 | 694 |
+| Warsaw | 52.165833, 20.967222 | 245 |
+| Hong Kong | 22.308889, 113.914444 | 419 |
 
-These rules lead to two workflows, plus a way to retrieve the result:
+Shipping costs **$0.01 per kilogram per kilometre**, and an order can draw stock from several warehouses at once. If the cheapest possible shipping still exceeds **15% of the discounted order total**, the order is invalid — full stop, no partial fulfillment workaround.
+
+That leads to two workflows, plus a way to look one up afterward:
 
 | Endpoint | Behaviour |
 | --- | --- |
-| `POST /v1/order-quotes` | Return price, discount, shipping, allocation, and validity without changing inventory. |
-| `POST /v1/orders` | Recalculate against current stock, commit the order, and immediately deduct inventory. |
-| `GET /v1/orders/:orderNumber` | Return the amounts and allocation stored at submission. |
+| `POST /v1/order-quotes` | Simulate price, discount, shipping, and allocation without touching inventory. |
+| `POST /v1/orders` | Recalculate against live stock, commit atomically, and deduct inventory immediately. |
+| `GET /v1/orders/:orderNumber` | Return the amounts and allocation exactly as they were at submission. |
 
-This addresses the brief's functional requirements. TypeScript, PostgreSQL, OpenAPI documentation, Docker setup, and the testing strategy below address its technical requirements.
+Those three satisfy the brief's functional requirements. TypeScript, PostgreSQL, OpenAPI docs, Docker, and the testing strategy below satisfy its technical ones.
 
-## Architecture
+## Architecture at a glance
 
-The service is a modular monolith. Both workflows share the same domain rules; HTTP handling and persistence sit behind separate boundaries.
+The service is a modular monolith, not a distributed system pretending to need six warehouses' worth of microservices:
 
 ```mermaid
 flowchart TD
@@ -31,72 +42,98 @@ flowchart TD
     Adapters --> DB[(PostgreSQL)]
 ```
 
-The arrows show code dependencies. The domain has no HTTP or database dependencies, and the submission use case contains no SQL. The PostgreSQL unit of work supplies repositories that share one transaction connection.
+The domain layer has no idea Fastify, `postgres`, or AWS exist — no HTTP objects, no SQL, no imports pointing outward. The submission use case orchestrates a unit of work; it doesn't write queries itself.
 
 ```text
 src/
-  presentation/     HTTP routes, validation, OpenAPI and startup
+  presentation/     HTTP routes, auth, validation, OpenAPI and startup
   application/      Quote, submit and retrieve workflows; transaction port
-  domain/           Business rules, models and repository interfaces
+  domain/           Pricing, allocation and validity rules, models
   infrastructure/   PostgreSQL adapters, migrations, outbox and metrics
 tests/
   unit/             Calculations without I/O
-  integration/      API, persistence and concurrency against PostgreSQL
+  integration/      API, persistence and concurrency against real PostgreSQL
 infra/pulumi/       AWS deployment definition
-docs/               Deployment details and remaining work
 ```
 
-## Decisions that matter
+If the shipping algorithm needs to change, nothing in `presentation/` should care. If PostgreSQL is swapped out, `domain/` doesn't notice.
 
-### Cheapest first is optimal for this tariff
+## Design decisions that matter
 
-For the specified device:
+### The greedy allocation is provably optimal — for this tariff
 
 ```text
-shipping cost per device = distanceKm × 0.365 kg × $0.01/(kg × km)
+shipping cost per device = distanceKm × 0.365 kg × $0.01/(kg·km)
 ```
 
-The allocator calculates Haversine distances, sorts an array of warehouses by distance, and takes available stock from each until the quantity is filled. Warehouse ID breaks distance ties. This takes **O(W log W)** time and **O(W)** space for `W` warehouses.
+Cost per unit is fixed per warehouse and purely linear in quantity, with zero cost for touching an additional warehouse. The allocator computes Haversine distance to all six, sorts by distance (warehouse ID breaks ties), and fills from the cheapest first. **Exchange argument**: if any valid plan uses a pricier warehouse while a cheaper one still has stock, moving one unit from the pricier to the cheaper warehouse strictly reduces cost without changing the total shipped. Repeat until no such pair exists, and you've reached the minimum. That's **O(W log W)** time, **O(W)** space — this depends entirely on the tariff being linear with no per-shipment fee; a flat fee per warehouse touched turns this into a knapsack-flavoured problem and greedy stops being optimal.
 
-The greedy choice follows an exchange argument: if a plan uses a more expensive warehouse while a cheaper one still has stock, moving a unit to the cheaper warehouse reduces cost without changing the quantity. Repeating that exchange gives the cheapest-first allocation. This depends on the linear tariff: a fixed fee per shipment would change the problem.
+### A quote is a simulation; a submission is a transaction
 
-### A quote is advisory; a submission is atomic
+A quote reads current stock and shows what *would* happen — it changes nothing and can go stale the instant someone else orders the last unit. Submission is where correctness actually has to hold: one PostgreSQL transaction that locks all six warehouse rows in ascending ID order, recalculates pricing and allocation against the now-locked stock, and only then writes the order, its allocations, inventory deductions, an audit record, and an outbox event. Commit or nothing.
 
-Suppose two representatives each request eight of the last ten devices. Both can receive a valid quote. Only one order can commit.
+Locking every warehouse row per submission is the simplest correct thing that could work, and it serializes submissions against each other — an explicit throughput trade-off, not an oversight. Quotes stay lock-free reads. Ascending-ID lock order is what prevents two concurrent submissions from deadlocking each other over the same two warehouses.
 
-Submission uses one PostgreSQL transaction to:
+An `Idempotency-Key` header covers the case where an order succeeds but the HTTP response gets lost: an identical retry replays the stored order; reusing the key with different input returns `409`. That guarantee is per-key, not per-caller — see [Known limitations](#known-limitations).
 
-1. Claim the optional idempotency key and lock warehouse rows in ascending ID order.
-2. Recalculate pricing and allocation, rejecting insufficient stock or excessive shipping.
-3. Save the order and allocations, deduct stock, and write inventory audit records and an outbox event.
+### Orders are snapshots, not live pointers
 
-Success is returned after commit. A failure rolls everything back. Conditional stock updates and a database constraint prevent negative inventory; consistent lock ordering prevents circular warehouse lock waits.
+Money is integer cents throughout; each warehouse's shipping charge is rounded to the cent *before* summing, and the 15% ceiling is rounded down so rounding can never let a borderline order sneak through. Everything used to price an order — unit price, discount tier, shipping rate, the threshold itself — is copied onto the order row at submission time, and `order_allocations` preserves exactly which warehouses shipped what, at what distance and cost. Change the price table next week and every historical order still reads back exactly as it was confirmed.
 
-Locking all six warehouses makes this straightforward, but serializes submissions. Quotes use ordinary reads. That is an explicit throughput trade-off to revisit under measured contention.
+## Data model
 
-An `Idempotency-Key` also handles a successful order followed by a lost HTTP response. An identical retry returns the stored order; reusing the key with different input returns `409`.
+```text
+products            One row: the SCOS Station P1 Pro. Price and weight, not hardcoded constants.
+warehouses           Six rows: location and live stock.
+pricing_rules        Discount tiers and shipping tariff as data, not code — versioned by is_active + created_at.
+orders               One row per submission: full pricing/shipping snapshot, order number, idempotency key.
+order_allocations    Per-warehouse breakdown of a committed order: quantity, distance, cost.
+idempotency_keys     Claims a key to one order id, so a concurrent duplicate resolves instead of racing.
+inventory_audit_log  Every stock delta, signed with a reason and (self-reported) sales rep id.
+outbox_events        Pending domain events for eventual external publication (see below).
+```
 
-### Preserve order snapshots
+`order_allocations` exists because "shipping cost: $427" isn't very useful to anyone actually fulfilling the order if you can't say which 120 units came from where.
 
-Money is stored in integer cents. Distance calculations use floating point; each warehouse's shipping charge is rounded to cents before summing. A fractional-cent shipping ceiling is rounded down so rounding cannot admit an order above the limit.
+## API
 
-Product metadata and pricing rules come from PostgreSQL. Orders retain the price, discount, shipping rate, charge, and threshold used at submission. `order_allocations` preserves each warehouse's identity, quantity, distance, and cost. Later price or warehouse changes therefore do not alter historical confirmations.
+Business endpoints and `/docs` require `Authorization: Bearer <API_TOKEN>` (constant-time comparison, one shared token — see [Known limitations](#known-limitations)); `/health` and `/ready` are public.
 
-The [schema and migrations](src/infrastructure/db/migrations.ts) also hold idempotency claims, inventory movements, and pending events. The challenge's product and warehouse data are [seeded](src/infrastructure/db/seeds.ts) once; restarting does not replenish stock.
+| Method & path | Purpose |
+| --- | --- |
+| `POST /v1/order-quotes` | Quote an order without side effects |
+| `POST /v1/orders` | Submit and commit an order (supports `Idempotency-Key`) |
+| `GET /v1/orders/:orderNumber` | Retrieve a committed order |
+| `GET /api/v1/warehouses` | Current stock per warehouse |
+| `GET /api/v1/alerts/stock` | Warehouses at or below 50 units |
+| `GET /metrics` | Prometheus-formatted counters and stock gauges |
+| `GET /health`, `GET /ready` | Liveness / readiness (public) |
+| `GET /docs`, `GET /docs/json` | Swagger UI / OpenAPI spec |
 
-## Trade-offs and growth
+Errors follow `application/problem+json` (RFC 7807 shape): `type`, `title`, `status`, `detail`.
 
-Haversine models geographic distance, not carrier routes. Inventory currently belongs to one product. These choices match the brief; multiple products would need order lines and inventory keyed by product and warehouse.
+## Known limitations
 
-Growth would change the design in specific ways:
+Deliberate scope cuts and honest gaps, not things I missed and hoped nobody would ask about:
 
-- **More quote traffic:** add API instances and consider caching product and pricing metadata, while budgeting database connections across instances.
-- **More order contention:** consider locking only selected warehouses or conditional deductions with full allocation retries.
-- **Many more warehouses:** consider spatial indexing, expanding the candidate set when nearby stock cannot fulfil an order.
+- **The shared bearer token is a trust boundary, not identity.** `x-sales-rep-id` is a client-supplied header written straight into the audit log with no verification — anyone holding the one token can attribute an order to any rep string. Fine for a demo; not fine once there's more than one caller who might lie.
+- **Idempotency keys are global, not per-caller.** Two reps who both happen to pick `"order-1"` as a key collide with `409` against each other's unrelated orders. There's currently no caller identity to scope the key by — see the point above.
+- **No rate limiting.** A leaked token allows unbounded quote/order traffic today.
+- **No CORS policy or security-header middleware.** Reasonable for a token-gated backend API with no browser client, but not a decision I want to leave implicit.
+- **No inventory reservation during a quote.** Intentional — quotes are advisory by design — but worth stating plainly.
+- Haversine distance, not carrier routing; one product, not a catalog. Both match the brief; a real multi-product system needs order lines and inventory keyed by product *and* warehouse.
 
-An internal sales tool could use the API today. The transactional outbox provides a path to warehouse fulfilment or an analytics warehouse later: consumers could derive shipping cost by region and inventory depletion without adding work to order submission. Quote conversion metrics would also need quote events and correlation IDs.
+## Testing strategy
 
-No external publisher is configured yet, so events remain pending. The dispatcher supports retries and concurrent workers; consumers must deduplicate because delivery is at least once. Integration and production tasks are tracked in [remaining work](docs/remaining-work.md).
+```text
+Unit          discount tiers, distance math, allocation, validity boundaries — no I/O
+Integration   real PostgreSQL: HTTP → persistence → response, migrations, outbox
+Concurrency   two connection pools racing the same warehouse; opposing-warehouse-preference
+              deadlock; concurrent idempotent duplicates; concurrent outbox drain with
+              FOR UPDATE SKIP LOCKED; concurrent migrations on overlapping startups
+```
+
+The concurrency tests use genuinely separate connection pools racing each other, not mocked locks — that's where an in-memory allocator would lie to you about correctness.
 
 ## Run locally
 
@@ -134,7 +171,7 @@ curl --fail-with-body http://localhost:3000/v1/order-quotes \
 
 The response includes pricing, warehouse allocation, shipping, and `isValid`, without changing inventory. To submit, send the same request to `/v1/orders` with `-H 'Idempotency-Key: local-order-1'`. This deducts stock and returns an `orderNumber`, which you can retrieve at `/v1/orders/:orderNumber` with the same authorization header. An identical retry with the same key returns the existing order.
 
-Other endpoints include `/api/v1/warehouses` for stock, `/metrics`, and `/docs/json` for OpenAPI. Swagger UI at `/docs/` also requires the authorization header; see the development option below for ordinary browser access.
+Other endpoints include `/api/v1/warehouses` for stock, `/api/v1/alerts/stock` for low-stock warehouses, `/metrics`, and `/docs/json` for OpenAPI. Swagger UI at `/docs/` also requires the authorization header; see the development option below for ordinary browser access.
 
 ### Stop, inspect, or reset
 
@@ -173,12 +210,41 @@ npm run lint
 
 The API does not need to be running. Tests use `TEST_DATABASE_URL` from `.env` and create isolated schemas in PostgreSQL, leaving application orders and stock untouched. Unavailable PostgreSQL fails the integration suite. `npm run test:unit` runs only the unit tests and needs no database.
 
-Unit tests cover discounts, distances, allocation, and validity boundaries. Integration tests exercise real PostgreSQL commits, rollback, snapshot preservation, duplicate requests, and competing orders through independent connection pools.
-
 ## Deployment
 
-GitHub Actions tests against PostgreSQL on Node 22 and 24, typechecks the code, and checks the Docker build. The manual **Deploy** workflow runs those checks, authenticates to AWS with OIDC, and uses Pulumi to publish the image and update our single environment. It then checks readiness, authentication, quoting, and order submission against the deployed API.
+Cloud hosting and CI/CD are explicitly optional for this challenge — everything above stands on its own via Docker Compose. This section exists to show the design, not to compensate for a weak local story.
 
-Pulumi defines ECR, an HTTPS load balancer, one Fargate task, private RDS PostgreSQL, logs, and secrets. The task uses a public subnet with inbound access restricted to the load balancer, avoiding a NAT gateway. One task and a single-AZ database limit cost at the expense of redundancy. State is stored in S3.
+```text
+Client --HTTPS--> CloudFront --HTTP via private VPC origin--> ALB --HTTP--> Fargate task --> RDS PostgreSQL
+```
 
-The workflow still needs its GitHub/AWS settings and a verified live deployment. The shared API token authenticates a trusted client; company identity and per-user permissions remain rollout work. See [deployment instructions](docs/deployment.md) for setup and remaining prerequisites.
+GitHub Actions runs CI (Postgres-backed tests on Node 22 & 24, typecheck, Docker build) on every push and PR. A manual **Deploy** workflow (`workflow_dispatch`, `main` only) authenticates to AWS via OIDC — no long-lived AWS keys in GitHub — and runs Pulumi against a single `demo` stack with state in a private S3 bucket:
+
+1. Re-run CI checks.
+2. Assume the deployment role via OIDC.
+3. `pulumi preview`, then `pulumi up` — builds and publishes the Docker image to ECR, deploys its digest to one Fargate task.
+4. Confirm the running task definition matches the published image digest.
+5. Run `scripts/smoke.mjs` against the live URL: readiness, auth rejection, a real quote, a real order submission, an idempotent retry, retrieval, and the OpenAPI document.
+
+Pulumi provisions ECR, CloudFront, a private ALB, one Fargate task, private single-AZ RDS PostgreSQL, CloudWatch logs, and Secrets Manager entries for the database URL and API token. **CloudFront terminates HTTPS** on its own generated `cloudfront.net` certificate — no domain purchase or DNS zone needed — and reaches the ALB over plain HTTP through a VPC origin; the ALB itself only accepts traffic from CloudFront's managed prefix list. The Fargate task sits in a public subnet with inbound access restricted to the ALB's security group, which avoids paying for a NAT gateway while keeping the task's only inbound path through the load balancer. One task and a single-AZ database trade redundancy for cost, deliberately, for a graded demo.
+
+**Access model:** the deployed API is authenticated the same way as local — one bearer token — but the live URL and token are Pulumi-managed secrets, not committed to this repo. They're not published here so a public GitHub repo doesn't double as an open invitation to hit a real AWS bill; if you'd like to exercise the live deployment, ask and I'll share both directly.
+
+**Status as of this submission:** the GitHub Actions deployment pipeline, IAM role, OIDC trust, and S3-backed Pulumi stack are fully configured; the first live deployment had not yet been run and verified end-to-end when this was written. Everything above is accurate to what the code does; treat "live and verified" as a status to confirm at review time rather than assume.
+
+## What I'd do next
+
+If this graduated from challenge to real project, roughly in order of urgency:
+
+- **Identity and permissions** — replace the shared token with the company identity provider, authorize sales/ops roles, and derive `sales_rep_id` from a verified claim instead of a client-supplied header.
+- **Rate limiting** on the API, now that there's a plan for who's allowed to call it and how much.
+- **Idempotency keys scoped per caller** once there's a caller identity to scope them by.
+- **Database operations** — a restricted runtime DB role separate from the migration role, and a proven backup-restore drill, before trusting this with real inventory.
+- **Monitoring** — request latency and lock-wait histograms, dashboards, alert routing, and an outbox-backlog alarm; the current counters and stock gauges are a start, not a monitored production deployment.
+- **Capacity** — load-test representative quote/submit traffic and set connection-pool budgets and timeouts from real numbers, rather than the current "lock all six warehouses" default. Revisit that locking strategy only if measured contention justifies something more complex.
+- **An external event publisher** for the outbox (currently events sit `PENDING` — the dispatcher, retries, and at-least-once delivery all work, there's just nowhere configured to send them yet). That unlocks warehouse fulfillment, conversion analytics, or a data warehouse feed without touching order submission.
+- **Multi-product support** if the catalog ever grows past one SKU — needs order lines and inventory keyed by product *and* warehouse, not just warehouse.
+
+## Tech stack
+
+TypeScript · Node.js · Fastify · PostgreSQL (`postgres` driver, hand-written SQL and migrations) · Zod · Vitest · Docker · Pulumi · AWS (ECS Fargate, RDS, ALB, CloudFront, ECR, Secrets Manager) · GitHub Actions

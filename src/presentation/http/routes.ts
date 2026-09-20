@@ -237,9 +237,7 @@ export function createRoutes(deps: RouteDependencies): FastifyPluginAsync {
       }
     };
 
-    // Quote Order and its existing alias
     app.post('/v1/order-quotes', { schema: quoteSchema }, quoteHandler);
-    app.post('/api/v1/orders/quote', { schema: quoteSchema }, quoteHandler);
 
     const submitHandler = async (request: any, reply: any) => {
       const validatedInput = SubmitOrderInputSchema.parse(request.body);
@@ -312,9 +310,7 @@ export function createRoutes(deps: RouteDependencies): FastifyPluginAsync {
       }
     };
 
-    // Submit Order and its existing alias
     app.post('/v1/orders', { schema: submitSchema }, submitHandler);
-    app.post('/api/v1/orders', { schema: submitSchema }, submitHandler);
 
     const getOrderHandler = async (request: any, reply: any) => {
       const { orderNumber } = request.params as { orderNumber: string };
@@ -335,9 +331,7 @@ export function createRoutes(deps: RouteDependencies): FastifyPluginAsync {
       }
     };
 
-    // Get Order and its existing alias
     app.get('/v1/orders/:orderNumber', { schema: getOrderSchema }, getOrderHandler);
-    app.get('/api/v1/orders/:orderNumber', { schema: getOrderSchema }, getOrderHandler);
 
     // Prometheus Operational Metrics Endpoint
     app.get(
