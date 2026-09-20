@@ -5,6 +5,7 @@ import { Coordinates } from '../../domain/models/Coordinates.js';
 import { OrderEvaluator } from '../../domain/services/OrderEvaluator.js';
 import { FulfillmentOptimizer } from '../../domain/services/FulfillmentOptimizer.js';
 import { QuoteOrderInput, OrderQuoteResponseDTO } from '../dtos/OrderDTOs.js';
+import { PricingRuleNotConfiguredError } from '../../domain/errors/DomainErrors.js';
 
 export class QuoteOrderUseCase {
   constructor(
@@ -26,7 +27,11 @@ export class QuoteOrderUseCase {
     const warehouses = await this.warehouseRepo.findAll();
 
     // 3. Fetch Active Pricing Rules (Rules as Data)
-    const pricingRule = this.pricingRuleRepo ? await this.pricingRuleRepo.getActiveRule() : null;
+    let pricingRule = null;
+    if (this.pricingRuleRepo) {
+      pricingRule = await this.pricingRuleRepo.getActiveRule();
+      if (!pricingRule) throw new PricingRuleNotConfiguredError();
+    }
 
     // 4. Domain Evaluation via OrderEvaluator
     const evaluation = OrderEvaluator.evaluate(

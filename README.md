@@ -31,7 +31,7 @@ Those three satisfy the brief's functional requirements. TypeScript, PostgreSQL,
 
 ## Architecture at a glance
 
-The service is a modular monolith, not a distributed system pretending to need six warehouses' worth of microservices:
+The service is a modular monolith: a single deployable with clear internal boundaries, rather than a distributed system built for a scale six warehouses don't require.
 
 ```mermaid
 flowchart TD
@@ -114,10 +114,10 @@ Errors follow `application/problem+json` (RFC 7807 shape): `type`, `title`, `sta
 
 ## Known limitations
 
-Deliberate scope cuts and honest gaps, not things I missed and hoped nobody would ask about:
+Deliberate scope cuts and gaps worth being explicit about:
 
 - **The shared bearer token is a trust boundary, not identity.** `x-sales-rep-id` is a client-supplied header written straight into the audit log with no verification — anyone holding the one token can attribute an order to any rep string. Fine for a demo; not fine once there's more than one caller who might lie.
-- **Idempotency keys are global, not per-caller.** Two reps who both happen to pick `"order-1"` as a key collide with `409` against each other's unrelated orders. There's currently no caller identity to scope the key by — see the point above.
+- **Idempotency keys are global, not per-caller, with two different failure modes depending on what collides.** The key is matched against a fingerprint of `(quantity, coordinates, salesRepId)`. If two callers reuse the same key with a *matching* fingerprint (same input, same or both-omitted `salesRepId`), the second caller silently receives the first caller's order back as a successful "replayed" response — not an error, and nothing distinguishes it from having submitted that order themselves. Only a fingerprint *mismatch* on a reused key returns `409 IDEMPOTENCY_CONFLICT`. There's currently no caller identity to scope keys by — see the point above.
 - **No rate limiting.** A leaked token allows unbounded quote/order traffic today.
 - **No CORS policy or security-header middleware.** Reasonable for a token-gated backend API with no browser client, but not a decision I want to leave implicit.
 - **No inventory reservation during a quote.** Intentional — quotes are advisory by design — but worth stating plainly.
@@ -218,7 +218,7 @@ Cloud hosting and CI/CD are explicitly optional for this challenge — everythin
 Client --HTTPS--> CloudFront --HTTP via private VPC origin--> ALB --HTTP--> Fargate task --> RDS PostgreSQL
 ```
 
-GitHub Actions runs CI (Postgres-backed tests on Node 22 & 24, typecheck, Docker build) on every push and PR. A manual **Deploy** workflow (`workflow_dispatch`, `main` only) authenticates to AWS via OIDC — no long-lived AWS keys in GitHub — and runs Pulumi against a single `demo` stack with state in a private S3 bucket:
+GitHub Actions runs CI (Postgres-backed tests on Node 22 & 24, typecheck, Docker build) on pushes to `main` and on pull requests targeting it — a push to a feature branch alone doesn't trigger it. A manual **Deploy** workflow (`workflow_dispatch`, `main` only) authenticates to AWS via OIDC — no long-lived AWS keys in GitHub — and runs Pulumi against a single `demo` stack with state in a private S3 bucket:
 
 1. Re-run CI checks.
 2. Assume the deployment role via OIDC.
@@ -228,9 +228,9 @@ GitHub Actions runs CI (Postgres-backed tests on Node 22 & 24, typecheck, Docker
 
 Pulumi provisions ECR, CloudFront, a private ALB, one Fargate task, private single-AZ RDS PostgreSQL, CloudWatch logs, and Secrets Manager entries for the database URL and API token. **CloudFront terminates HTTPS** on its own generated `cloudfront.net` certificate — no domain purchase or DNS zone needed — and reaches the ALB over plain HTTP through a VPC origin; the ALB itself only accepts traffic from CloudFront's managed prefix list. The Fargate task sits in a public subnet with inbound access restricted to the ALB's security group, which avoids paying for a NAT gateway while keeping the task's only inbound path through the load balancer. One task and a single-AZ database trade redundancy for cost, deliberately, for a graded demo.
 
-**Access model:** the deployed API is authenticated the same way as local — one bearer token — but the live URL and token are Pulumi-managed secrets, not committed to this repo. They're not published here so a public GitHub repo doesn't double as an open invitation to hit a real AWS bill; if you'd like to exercise the live deployment, ask and I'll share both directly.
+**Access model:** the deployed API is authenticated the same way as local — one bearer token, checked with a constant-time comparison. The token is stored encrypted in `infra/pulumi/Pulumi.demo.yaml` (safe to commit — Pulumi decrypts it with a stack passphrase that isn't in the repo) and injected into the running task via Secrets Manager; that authentication check, not the URL, is what actually protects the deployment. The CloudFront URL itself isn't secret — anyone who has it and a valid token can call it. I'm not publishing the URL or a live token in this README simply so the public repo doesn't invite unsolicited traffic against a resource-limited, real-money demo account; ask and I'll share both directly.
 
-**Status as of this submission:** the GitHub Actions deployment pipeline, IAM role, OIDC trust, and S3-backed Pulumi stack are fully configured; the first live deployment had not yet been run and verified end-to-end when this was written. Everything above is accurate to what the code does; treat "live and verified" as a status to confirm at review time rather than assume.
+**Status as of this submission:** GitHub Actions repository variables/secrets (`AWS_ROLE_ARN`, `PULUMI_BACKEND_URL`, `PULUMI_CONFIG_PASSPHRASE`) are set, and the OIDC trust and deployer role exist in AWS. The deployer IAM *policy document* in this repo (`infra/iam/sc-deployer-policy.json`) was updated for the CloudFront/VPC-origin resources added above, but editing that file doesn't update AWS by itself — the live policy attached to the role needs to be synced to it before the first deploy will succeed. The first live deployment had not yet been run when this was written; treat "deployed and verified" as a status to confirm at review time, not assume from this document.
 
 ## What I'd do next
 

@@ -230,6 +230,16 @@ describe('PostgreSQL order API', () => {
     await expect(f.quote.execute(nearNY)).rejects.toThrow();
   });
 
+  it('fails clearly instead of silently applying hardcoded defaults when no pricing rule is active', async () => {
+    await f.db.query('UPDATE pricing_rules SET is_active = 0');
+    await expect(f.quote.execute(nearNY)).rejects.toMatchObject({
+      code: 'PRICING_RULE_NOT_CONFIGURED'
+    });
+    await expect(f.submit.execute(nearNY)).rejects.toMatchObject({
+      code: 'PRICING_RULE_NOT_CONFIGURED'
+    });
+  });
+
   it('rechecks stock at submission instead of treating a quote as a reservation', async () => {
     expect((await f.quote.execute(nearNY)).isValid).toBe(true);
     await f.db.query('UPDATE warehouses SET stock = 0');
